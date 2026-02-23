@@ -10,6 +10,7 @@ Usage:
 
 import argparse
 import math
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -47,6 +48,54 @@ def plot_polygon(ax, xy, score=None, color_by_score=False):
     ax.axis("off")
 
 
+def plot_file(
+    file: str | Path,
+    *,
+    num: int = 16,
+    compute_score: bool = False,
+    show_scores: bool = False,
+    color_by_score: bool = False,
+    no_color_by_score: bool = False,
+):
+    """Plot polygons from a saved .npz file and return (fig, axes)."""
+    data_dir = paths.RAW_DATA_DIR
+    file_path = paths.resolve_path(file, data_dir)
+
+    data = np.load(file_path)
+    coords = data["coords"]
+    score = data["score"] if "score" in data else None
+    if score is None and compute_score:
+        score = _compute_scores(coords)
+
+    use_score_color = color_by_score or (score is not None and not no_color_by_score)
+    # Preserve original behavior for training/generated data:
+    # if score exists in the file, show numeric labels by default.
+    use_show_scores = (score is not None) or show_scores or compute_score
+
+    num = min(num, coords.shape[0])
+    cols = int(math.ceil(math.sqrt(num)))
+    rows = int(math.ceil(num / cols))
+
+    fig, axes = plt.subplots(rows, cols, figsize=(3 * cols, 3 * rows))
+    axes = np.array(axes).reshape(-1)
+
+    for i in range(num):
+        plot_polygon(
+            axes[i],
+            coords[i],
+            score=None if score is None else score[i],
+            color_by_score=use_score_color,
+        )
+        if use_show_scores and score is not None:
+            axes[i].set_title(f"{score[i]:.3f}", fontsize=9)
+
+    for j in range(num, len(axes)):
+        axes[j].axis("off")
+
+    plt.tight_layout()
+    return fig, axes
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument(
@@ -65,41 +114,14 @@ def main():
     p.add_argument("--no_color_by_score", action="store_true", help="disable score-based coloring")
     args = p.parse_args()
 
-    data_dir = paths.RAW_DATA_DIR
-    file_path = paths.resolve_path(args.file, data_dir)
-
-    data = np.load(file_path)
-    coords = data["coords"]
-    score = data["score"] if "score" in data else None
-    if score is None and args.compute_score:
-        score = _compute_scores(coords)
-
-    use_score_color = args.color_by_score or (score is not None and not args.no_color_by_score)
-    # Preserve original behavior for training/generated data:
-    # if score exists in the file, show numeric labels by default.
-    show_scores = (score is not None) or args.show_scores or args.compute_score
-
-    num = min(args.num, coords.shape[0])
-    cols = int(math.ceil(math.sqrt(num)))
-    rows = int(math.ceil(num / cols))
-
-    fig, axes = plt.subplots(rows, cols, figsize=(3 * cols, 3 * rows))
-    axes = np.array(axes).reshape(-1)
-
-    for i in range(num):
-        plot_polygon(
-            axes[i],
-            coords[i],
-            score=None if score is None else score[i],
-            color_by_score=use_score_color,
-        )
-        if show_scores and score is not None:
-            axes[i].set_title(f"{score[i]:.3f}", fontsize=9)
-
-    for j in range(num, len(axes)):
-        axes[j].axis("off")
-
-    plt.tight_layout()
+    plot_file(
+        args.file,
+        num=args.num,
+        compute_score=args.compute_score,
+        show_scores=args.show_scores,
+        color_by_score=args.color_by_score,
+        no_color_by_score=args.no_color_by_score,
+    )
     plt.show()
 
 
