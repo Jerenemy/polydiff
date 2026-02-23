@@ -1,0 +1,10 @@
+# Ignore data by default
+*
+
+# Keep structure and docs
+!README.md
+!raw/
+!processed/
+!raw/.gitkeep
+!processed/.gitkeep
+!.gitignore
