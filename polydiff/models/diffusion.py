@@ -163,4 +163,3 @@ class Diffusion:
         
         # minimize mean squared error: ||ε_hat - ε||^2
         return nn.functional.mse_loss(eps_pred, noise)
-    
