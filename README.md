@@ -17,7 +17,7 @@ DDPM diffusion model to generate 2D polygons. This repo is structured for clean 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e .[dev]
+pip install -e .[dev] # or: poetry install
 ```
 
 2. Generate polygons (saved to `data/raw/` by default)

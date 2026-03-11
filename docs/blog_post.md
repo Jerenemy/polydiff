@@ -2,7 +2,7 @@
 
 What if you could start with pure Gaussian noise and end up with clean, plausible geometry? That is exactly what I’m building in this project: a diffusion model that learns a distribution over 2D polygons and then generates new polygon shapes from scratch.
 
-This is compelling to me for two reasons. First, it is a clean sandbox for understanding generative modeling mechanics without the overhead of images or huge datasets. Second, polygon generation is still genuinely useful: synthetic geometric data supports simulation, CAD-style workflows, shape priors, and future conditioning tasks where we care about controllable structure.
+This is compelling to me for two reasons. First, it is a clean sandbox for understanding generative modeling mechanics without the overhead of images or huge datasets. Second, polygon generation is still actually useful: synthetic geometric data supports simulation, CAD-style workflows, shape priors, and future conditioning tasks where we care about controllable structure.
 
 Project repository: [github.com/Jerenemy/polydiff](https://github.com/Jerenemy/polydiff)
 

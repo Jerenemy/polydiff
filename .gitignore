@@ -37,3 +37,6 @@ pretrained_models/*.pt
 
 # Logs
 *.log
+
+# testing
+testpkg/
