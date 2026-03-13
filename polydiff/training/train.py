@@ -54,10 +54,10 @@ def train_from_config(config_path: Path) -> None:
     shuffle = bool(data_cfg.get("shuffle", True))
     num_workers = int(data_cfg.get("num_workers", 0))
 
-    data = np.load(data_path)
-    coords = data["coords"].astype(np.float32)
-    n = coords.shape[1]
-    x = coords.reshape(coords.shape[0], -1)
+    data = np.load(data_path) # load from npz file
+    coords = data["coords"].astype(np.float32) # index desired var, convert to desired type
+    n = coords.shape[1] # get shape of polygon
+    x = coords.reshape(coords.shape[0], -1) # reshape to be num_datapts, polygon_size*2 shape. np arr in row-major order, so keep first dim fixed, then 2nd dim is dynamically chosen (in this case each entry is now len 12, x0, y0, x1, y1, ..., x5, y5. x,y used to be two separate columns)
 
     dataset = TensorDataset(torch.from_numpy(x))
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
@@ -99,7 +99,7 @@ def train_from_config(config_path: Path) -> None:
             opt.step()
 
             if global_step % log_every == 0:
-                print(f"[train] epoch {epoch} step {global_step} loss {loss.item():.6f}")
+                print(f"[train] epoch {epoch} step {global_step} loss {loss.item():.6f}") #TODO: add logging
 
             if global_step % save_every == 0 and global_step > 0:
                 ckpt_path = save_dir / f"diffusion_step_{global_step}.pt"
@@ -110,13 +110,13 @@ def train_from_config(config_path: Path) -> None:
                     model_cfg,
                     n,
                 )
-                print(f"[train] saved {ckpt_path}")
+                print(f"[train] saved {ckpt_path}") # TODO: logging
 
             global_step += 1
 
     final_path = save_dir / "diffusion_final.pt"
     _save_checkpoint(final_path, model, diffusion_config, model_cfg, n)
-    print(f"[train] saved {final_path}")
+    print(f"[train] saved {final_path}") # TODO: logging
 
 
 def _save_checkpoint(
