@@ -11,3 +11,9 @@ sampling:
   # Optional inference-time override (must be <= checkpoint diffusion.n_steps)
   # n_steps: 25
   out_path: "data/processed/samples.npz"
+  # Optional GIF export of one sample's reverse diffusion trajectory.
+  # animation:
+  #   out_path: "data/processed/sample_trajectory.gif"
+  #   sample_index: 0
+  #   max_frames: 120
+  #   fps: 12

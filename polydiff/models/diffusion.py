@@ -103,6 +103,12 @@ class Diffusion:
             betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
         )
 
+    def _resolve_n_steps(self, n_steps: Optional[int]) -> int:
+        steps = self.config.n_steps if n_steps is None else int(n_steps)
+        if steps < 1 or steps > self.config.n_steps:
+            raise ValueError(f"n_steps must be in [1, {self.config.n_steps}], got {steps}")
+        return steps
+
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
         """Forward diffusion (adding noise). Create x_t in in one shot"""
         sqrt_ab = self.sqrt_alphas_cumprod[t].unsqueeze(1)              # gather sqrt(ᾱ_t) per sample, shape (B,1)
@@ -137,19 +143,51 @@ class Diffusion:
         # x_{t-1} = μθ + sqrt(β̃_t) * z# fresh Gaussian noise z ~ N(0,I)
         return model_mean + torch.sqrt(posterior_var_t) * noise
 
-    def p_sample_loop(self, shape: tuple[int, int], n_steps: Optional[int] = None) -> torch.Tensor:
-        """Generate samples starting from pure noise x_T ~ N(0,I)."""
-        steps = self.config.n_steps if n_steps is None else int(n_steps) # choose how many reverse steps to run
-        if steps < 1 or steps > self.config.n_steps:
-            raise ValueError(f"n_steps must be in [1, {self.config.n_steps}], got {steps}")
+    def _sample_loop(
+        self,
+        shape: tuple[int, int],
+        *,
+        steps: int,
+        trajectory_index: Optional[int] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if trajectory_index is not None and not 0 <= trajectory_index < shape[0]:
+            raise ValueError(f"trajectory_index must be in [0, {shape[0] - 1}], got {trajectory_index}")
 
         self.model.eval()
         with torch.no_grad():
             x = torch.randn(shape, device=self.device)      # initialize x_T as standard Gaussian noise
+            trajectory = None
+            if trajectory_index is not None:
+                trajectory = [x[trajectory_index].detach().cpu().clone()]
             for step in reversed(range(steps)):             # iterate t = steps-1, ..., 0
                 t = torch.full((shape[0],), step, device=self.device, dtype=torch.long) # batch of identical t
                 x = self.p_sample(x, t)                     # sample x_{t-1} from x_t
+                if trajectory is not None:
+                    trajectory.append(x[trajectory_index].detach().cpu().clone())
+
+        if trajectory is None:
+            return x, None
+        return x, torch.stack(trajectory, dim=0)
+
+    def p_sample_loop(self, shape: tuple[int, int], n_steps: Optional[int] = None) -> torch.Tensor:
+        """Generate samples starting from pure noise x_T ~ N(0,I)."""
+        steps = self._resolve_n_steps(n_steps)
+        x, _ = self._sample_loop(shape, steps=steps)
         return x                                            # final x is a generated sample (approx x_0)
+
+    def p_sample_loop_trajectory(
+        self,
+        shape: tuple[int, int],
+        *,
+        n_steps: Optional[int] = None,
+        trajectory_index: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Generate samples and record one sample's denoising trajectory."""
+        steps = self._resolve_n_steps(n_steps)
+        x, trajectory = self._sample_loop(shape, steps=steps, trajectory_index=trajectory_index)
+        if trajectory is None:
+            raise RuntimeError("trajectory capture unexpectedly returned no trajectory")
+        return x, trajectory
 
     def loss(self, x0: torch.Tensor) -> torch.Tensor:
         """Training loss: predict the noise used to create x_t from x_0."""

@@ -48,6 +48,92 @@ def plot_polygon(ax, xy, score=None, color_by_score=False):
     ax.axis("off")
 
 
+def select_animation_frames(coords: np.ndarray, *, max_frames: int) -> tuple[np.ndarray, np.ndarray]:
+    """Select evenly spaced animation frames while always keeping endpoints."""
+    if coords.ndim != 3 or coords.shape[-1] != 2:
+        raise ValueError(f"coords must have shape (frames, vertices, 2), got {coords.shape}")
+    if max_frames < 2:
+        raise ValueError(f"max_frames must be at least 2, got {max_frames}")
+
+    total_frames = coords.shape[0]
+    if total_frames <= max_frames:
+        indices = np.arange(total_frames, dtype=np.int32)
+        return coords, indices
+
+    raw = np.linspace(0, total_frames - 1, num=max_frames, dtype=np.float64)
+    indices = np.unique(np.round(raw).astype(np.int32))
+    if indices[0] != 0:
+        indices = np.insert(indices, 0, 0)
+    if indices[-1] != total_frames - 1:
+        indices = np.append(indices, total_frames - 1)
+    return coords[indices], indices
+
+
+def save_polygon_animation(
+    coords: np.ndarray,
+    out_path: str | Path,
+    *,
+    fps: int = 12,
+    max_frames: int = 120,
+) -> Path:
+    """Save a GIF showing one polygon's denoising trajectory."""
+    if fps < 1:
+        raise ValueError(f"fps must be at least 1, got {fps}")
+
+    out_path = Path(out_path)
+    if out_path.suffix == "":
+        out_path = out_path.with_suffix(".gif")
+    if out_path.suffix.lower() != ".gif":
+        raise ValueError(f"animation output must be a .gif file, got {out_path}")
+
+    try:
+        import PIL  # noqa: F401
+        from matplotlib.animation import FuncAnimation, PillowWriter
+    except ImportError as exc:
+        raise RuntimeError("saving GIF animations requires Pillow; install it with `poetry add pillow`") from exc
+
+    frames, frame_indices = select_animation_frames(coords, max_frames=max_frames)
+
+    x_min = float(frames[:, :, 0].min())
+    x_max = float(frames[:, :, 0].max())
+    y_min = float(frames[:, :, 1].min())
+    y_max = float(frames[:, :, 1].max())
+
+    x_pad = max((x_max - x_min) * 0.15, 0.25)
+    y_pad = max((y_max - y_min) * 0.15, 0.25)
+
+    fig, ax = plt.subplots(figsize=(4, 4))
+    line, = ax.plot([], [], color="black", linewidth=2)
+    points = ax.scatter([], [], s=18, color="black")
+    title = ax.set_title("")
+
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.set_xlim(x_min - x_pad, x_max + x_pad)
+    ax.set_ylim(y_min - y_pad, y_max + y_pad)
+
+    def _update(frame_idx: int):
+        xy = frames[frame_idx]
+        xy_closed = np.vstack([xy, xy[0]])
+        line.set_data(xy_closed[:, 0], xy_closed[:, 1])
+        points.set_offsets(xy)
+        title.set_text(f"frame {frame_indices[frame_idx] + 1}/{coords.shape[0]}")
+        return line, points, title
+
+    animation = FuncAnimation(
+        fig,
+        _update,
+        frames=len(frames),
+        interval=int(round(1000 / fps)),
+        blit=False,
+    )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    animation.save(out_path, writer=PillowWriter(fps=fps))
+    plt.close(fig)
+    return out_path
+
+
 def plot_file(
     file: str | Path,
     *,

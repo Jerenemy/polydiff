@@ -78,6 +78,21 @@ sampling:
 ```
 `sampling.n_steps` must be between `1` and the checkpoint's trained diffusion steps.
 
+To save a GIF of one polygon denoising from pure noise to the final sample:
+```bash
+poetry add pillow
+
+python -m polydiff.sampling.sample \
+  --config configs/sample_diffusion.yaml \
+  --save_animation data/processed/sample_trajectory.gif
+```
+
+Animation options:
+- `--animation_index`: which sample in the batch to animate (default `0`)
+- `--animation_max_frames`: cap encoded frames to keep GIF size reasonable (default `120`)
+- `--animation_fps`: playback speed for the GIF (default `12`)
+- The same settings can also live under `sampling.animation` in the sampling config.
+
 Visualize sampled outputs:
 ```bash
 # samples are written to data/processed/samples.npz by default
@@ -109,4 +124,3 @@ whats the analogy for adding in the context of the target protein?
 does the message passing go between the molecule and the protein? 
 how do the features get added into the molecule (like the rd kit features)?
 how to add in the atom type
-
