@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 import torch
 import torch.nn as nn
+
+from .gat import GAT
+from .gcn import GraphConvolution
 
 
 class SinusoidalPosEmb(nn.Module):
@@ -52,6 +55,205 @@ class DenoiseMLP(nn.Module):
         emb = self.time_mlp(t)                              # compute time embedding from t: (B,) -> (B, time_emb_dim)
         h = torch.cat([x, emb], dim=1)                      # concatenate features: (B, data_dim + time_emb_dim)
         return self.net(h)                                  # predict eps_hat: (B, data_dim)
+
+class DenoiseGAT(nn.Module):
+    def __init__(self, data_dim: int, hidden_dim: int, time_emb_dim: int, num_layers: int) -> None:
+        super().__init__()
+        if data_dim % 2 != 0:
+            raise ValueError(f"data_dim must be even for flattened 2D polygon coordinates, got {data_dim}")
+        if num_layers < 1:
+            raise ValueError(f"num_layers must be >= 1, got {num_layers}")
+
+        self.data_dim = data_dim
+        self.coord_dim = 2
+        self.num_vertices = data_dim // self.coord_dim
+        self.time_emb_dim = time_emb_dim
+
+        self.time_mlp = nn.Sequential(
+            SinusoidalPosEmb(time_emb_dim),
+            nn.Linear(time_emb_dim, time_emb_dim),
+            nn.SiLU(),
+        )
+
+        node_in_dim = self.coord_dim + time_emb_dim
+        hidden_heads = 4 if hidden_dim >= 4 else 1
+        hidden_per_head = max(1, hidden_dim // hidden_heads)
+        num_heads_per_layer = [hidden_heads] * max(0, num_layers - 1) + [1]
+        num_features_per_layer = [node_in_dim]
+        if num_layers > 1:
+            num_features_per_layer.extend([hidden_per_head] * (num_layers - 1))
+        num_features_per_layer.append(hidden_dim)
+
+        self.gat = GAT(
+            num_of_layers=num_layers,
+            num_heads_per_layer=num_heads_per_layer,
+            num_features_per_layer=num_features_per_layer,
+            dropout=0.0,
+        )
+        self.node_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, self.coord_dim),
+        )
+        self.register_buffer("base_edge_index", self._build_cycle_edge_index(self.num_vertices), persistent=False)
+
+    @staticmethod
+    def _build_cycle_edge_index(num_vertices: int) -> torch.Tensor:
+        nodes = torch.arange(num_vertices, dtype=torch.long)
+        next_nodes = torch.roll(nodes, shifts=-1)
+        prev_nodes = torch.roll(nodes, shifts=1)
+        return torch.stack(
+            [
+                torch.cat([nodes, nodes, nodes], dim=0),
+                torch.cat([next_nodes, prev_nodes, nodes], dim=0),
+            ],
+            dim=0,
+        )
+
+    def _batched_edge_index(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        edge_index = self.base_edge_index.to(device)
+        num_edges = edge_index.shape[1]
+        offsets = (
+            torch.arange(batch_size, device=device, dtype=edge_index.dtype)
+            .repeat_interleave(num_edges)
+            .mul(self.num_vertices)
+        )
+        return edge_index.repeat(1, batch_size) + offsets.unsqueeze(0)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 2 or x.shape[1] != self.data_dim:
+            raise ValueError(f"x must have shape (batch, {self.data_dim}), got {tuple(x.shape)}")
+        if t.ndim != 1 or t.shape[0] != x.shape[0]:
+            raise ValueError(f"t must have shape ({x.shape[0]},), got {tuple(t.shape)}")
+
+        batch_size = x.shape[0]
+        coords = x.reshape(batch_size, self.num_vertices, self.coord_dim)
+        time_emb = self.time_mlp(t).unsqueeze(1).expand(-1, self.num_vertices, -1)
+        node_features = torch.cat([coords, time_emb], dim=-1).reshape(batch_size * self.num_vertices, -1)
+        edge_index = self._batched_edge_index(batch_size, x.device)
+        node_hidden, _ = self.gat((node_features, edge_index))
+        node_noise = self.node_head(node_hidden)
+        return node_noise.reshape(batch_size, self.data_dim)
+
+
+class DenoiseGCN(nn.Module):
+    def __init__(self, data_dim: int, hidden_dim: int, time_emb_dim: int, num_layers: int) -> None:
+        super().__init__()
+        if data_dim % 2 != 0:
+            raise ValueError(f"data_dim must be even for flattened 2D polygon coordinates, got {data_dim}")
+        if num_layers < 1:
+            raise ValueError(f"num_layers must be >= 1, got {num_layers}")
+
+        self.data_dim = data_dim
+        self.coord_dim = 2
+        self.num_vertices = data_dim // self.coord_dim
+
+        self.time_mlp = nn.Sequential(
+            SinusoidalPosEmb(time_emb_dim),
+            nn.Linear(time_emb_dim, time_emb_dim),
+            nn.SiLU(),
+        )
+
+        dims = [self.coord_dim + time_emb_dim]
+        dims.extend([hidden_dim] * num_layers)
+        self.layers = nn.ModuleList(
+            GraphConvolution(dims[i], dims[i + 1])
+            for i in range(len(dims) - 1)
+        )
+        self.residual_projs = nn.ModuleList(
+            nn.Identity() if dims[i] == dims[i + 1] else nn.Linear(dims[i], dims[i + 1], bias=False)
+            for i in range(len(dims) - 1)
+        )
+        self.activation = nn.SiLU()
+        self.node_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, self.coord_dim),
+        )
+        self.register_buffer("base_adj_indices", self._build_cycle_adj_indices(self.num_vertices), persistent=False)
+        self.register_buffer(
+            "base_adj_values",
+            torch.full((self.base_adj_indices.shape[1],), 1.0 / 3.0, dtype=torch.float32),
+            persistent=False,
+        )
+
+    @staticmethod
+    def _build_cycle_adj_indices(num_vertices: int) -> torch.Tensor:
+        nodes = torch.arange(num_vertices, dtype=torch.long)
+        next_nodes = torch.roll(nodes, shifts=-1)
+        prev_nodes = torch.roll(nodes, shifts=1)
+        return torch.stack(
+            [
+                torch.cat([nodes, nodes, nodes], dim=0),
+                torch.cat([nodes, next_nodes, prev_nodes], dim=0),
+            ],
+            dim=0,
+        )
+
+    def _batched_adj(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        base_indices = self.base_adj_indices.to(device)
+        num_edges = base_indices.shape[1]
+        offsets = (
+            torch.arange(batch_size, device=device, dtype=base_indices.dtype)
+            .repeat_interleave(num_edges)
+            .mul(self.num_vertices)
+        )
+        indices = base_indices.repeat(1, batch_size) + offsets.unsqueeze(0)
+        values = self.base_adj_values.to(device).repeat(batch_size)
+        size = (batch_size * self.num_vertices, batch_size * self.num_vertices)
+        return torch.sparse_coo_tensor(indices, values, size=size, device=device).coalesce()
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 2 or x.shape[1] != self.data_dim:
+            raise ValueError(f"x must have shape (batch, {self.data_dim}), got {tuple(x.shape)}")
+        if t.ndim != 1 or t.shape[0] != x.shape[0]:
+            raise ValueError(f"t must have shape ({x.shape[0]},), got {tuple(t.shape)}")
+
+        batch_size = x.shape[0]
+        coords = x.reshape(batch_size, self.num_vertices, self.coord_dim)
+        time_emb = self.time_mlp(t).unsqueeze(1).expand(-1, self.num_vertices, -1)
+        h = torch.cat([coords, time_emb], dim=-1).reshape(batch_size * self.num_vertices, -1)
+        adj = self._batched_adj(batch_size, x.device)
+
+        for i, layer in enumerate(self.layers):
+            residual = self.residual_projs[i](h)
+            h = layer(h, adj) + residual
+            h = self.activation(h)
+
+        h = self.node_head(h)
+        return h.reshape(batch_size, self.data_dim)
+
+
+def build_denoiser(*, data_dim: int, model_cfg: Mapping[str, Any] | None = None) -> nn.Module:
+    cfg = {} if model_cfg is None else dict(model_cfg)
+    model_type = str(cfg.get("type", "gat")).lower()
+    hidden_dim = int(cfg.get("hidden_dim", 256))
+    time_emb_dim = int(cfg.get("time_emb_dim", 64))
+    num_layers = int(cfg.get("num_layers", 3))
+
+    if model_type == "mlp":
+        return DenoiseMLP(
+            data_dim=data_dim,
+            hidden_dim=hidden_dim,
+            time_emb_dim=time_emb_dim,
+            num_layers=num_layers,
+        )
+    if model_type == "gat":
+        return DenoiseGAT(
+            data_dim=data_dim,
+            hidden_dim=hidden_dim,
+            time_emb_dim=time_emb_dim,
+            num_layers=num_layers,
+        )
+    if model_type == "gcn":
+        return DenoiseGCN(
+            data_dim=data_dim,
+            hidden_dim=hidden_dim,
+            time_emb_dim=time_emb_dim,
+            num_layers=num_layers,
+        )
+    raise ValueError(f"Unsupported model.type {model_type!r}; expected one of: mlp, gat, gcn")
+
 
 
 @dataclass

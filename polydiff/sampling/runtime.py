@@ -17,7 +17,7 @@ from ..data.diagnostics import (
     json_ready,
     summarize_polygon_dataset,
 )
-from ..models.diffusion import DenoiseMLP, Diffusion, DiffusionConfig
+from ..models.diffusion import Diffusion, DiffusionConfig, build_denoiser
 from ..utils.runtime import resolve_project_path
 
 DEFAULT_ANIMATION_OUT_PATH = "data/processed/sample_trajectory.gif"
@@ -54,14 +54,10 @@ def load_diffusion_from_checkpoint(
 ) -> tuple[dict[str, Any], Diffusion, DiffusionConfig, int]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
-    checkpoint_model_cfg = checkpoint.get("model_cfg", {})
+    checkpoint_model_cfg = dict(checkpoint.get("model_cfg", {}))
+    checkpoint_model_cfg.setdefault("type", "gat")
     n_vertices = int(checkpoint.get("n_vertices", 6))
-    model = DenoiseMLP(
-        data_dim=n_vertices * 2,
-        hidden_dim=int(checkpoint_model_cfg.get("hidden_dim", 256)),
-        time_emb_dim=int(checkpoint_model_cfg.get("time_emb_dim", 64)),
-        num_layers=int(checkpoint_model_cfg.get("num_layers", 3)),
-    )
+    model = build_denoiser(data_dim=n_vertices * 2, model_cfg=checkpoint_model_cfg)
     model.load_state_dict(checkpoint["model_state"])
 
     checkpoint_diffusion_cfg = checkpoint.get("diffusion", {})

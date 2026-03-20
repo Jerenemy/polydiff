@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from .. import paths
 from ..data.diagnostics import summarize_polygon_dataset
-from ..models.diffusion import DenoiseMLP, Diffusion, DiffusionConfig
+from ..models.diffusion import Diffusion, DiffusionConfig, build_denoiser
 from ..utils.runtime import device_from_config, load_yaml_config, resolve_project_path, set_seed
 from .runtime import (
     grad_norm,
@@ -49,13 +49,9 @@ def train_from_config(config_path: Path) -> None:
     dataset = TensorDataset(torch.from_numpy(x))
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
 
-    model_cfg = cfg.get("model", {})
-    model = DenoiseMLP(
-        data_dim=x.shape[1],
-        hidden_dim=int(model_cfg.get("hidden_dim", 256)),
-        time_emb_dim=int(model_cfg.get("time_emb_dim", 64)),
-        num_layers=int(model_cfg.get("num_layers", 3)),
-    )
+    model_cfg = dict(cfg.get("model", {}))
+    model_cfg.setdefault("type", "gat")
+    model = build_denoiser(data_dim=x.shape[1], model_cfg=model_cfg)
 
     diff_cfg = cfg.get("diffusion", {})
     diffusion_config = DiffusionConfig(
