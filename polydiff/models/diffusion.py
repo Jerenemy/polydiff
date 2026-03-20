@@ -68,14 +68,20 @@ class DenoiseGAT(nn.Module):
         self.coord_dim = 2
         self.num_vertices = data_dim // self.coord_dim
         self.time_emb_dim = time_emb_dim
+        self.pos_enc_dim = 4
 
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(time_emb_dim),
             nn.Linear(time_emb_dim, time_emb_dim),
             nn.SiLU(),
         )
+        self.register_buffer(
+            "vertex_positional_features",
+            self._build_cycle_positional_features(self.num_vertices),
+            persistent=False,
+        )
 
-        node_in_dim = self.coord_dim + time_emb_dim
+        node_in_dim = self.coord_dim + self.pos_enc_dim + time_emb_dim
         hidden_heads = 4 if hidden_dim >= 4 else 1
         hidden_per_head = max(1, hidden_dim // hidden_heads)
         num_heads_per_layer = [hidden_heads] * max(0, num_layers - 1) + [1]
@@ -110,6 +116,19 @@ class DenoiseGAT(nn.Module):
             dim=0,
         )
 
+    @staticmethod
+    def _build_cycle_positional_features(num_vertices: int) -> torch.Tensor:
+        phase = torch.arange(num_vertices, dtype=torch.float32) * (2.0 * torch.pi / num_vertices)
+        return torch.stack(
+            [
+                torch.sin(phase),
+                torch.cos(phase),
+                torch.sin(2.0 * phase),
+                torch.cos(2.0 * phase),
+            ],
+            dim=1,
+        )
+
     def _batched_edge_index(self, batch_size: int, device: torch.device) -> torch.Tensor:
         edge_index = self.base_edge_index.to(device)
         num_edges = edge_index.shape[1]
@@ -129,7 +148,8 @@ class DenoiseGAT(nn.Module):
         batch_size = x.shape[0]
         coords = x.reshape(batch_size, self.num_vertices, self.coord_dim)
         time_emb = self.time_mlp(t).unsqueeze(1).expand(-1, self.num_vertices, -1)
-        node_features = torch.cat([coords, time_emb], dim=-1).reshape(batch_size * self.num_vertices, -1)
+        pos_enc = self.vertex_positional_features.to(x.device).unsqueeze(0).expand(batch_size, -1, -1)
+        node_features = torch.cat([coords, pos_enc, time_emb], dim=-1).reshape(batch_size * self.num_vertices, -1)
         edge_index = self._batched_edge_index(batch_size, x.device)
         node_hidden, _ = self.gat((node_features, edge_index))
         node_noise = self.node_head(node_hidden)
