@@ -15,13 +15,19 @@ model:
   num_layers: 3
 
 diffusion:
-  n_steps: 1000
+  n_steps: 200
   beta_start: 0.0001
   beta_end: 0.02
 
 training:
-  epochs: 100
+  epochs: 60
   lr: 0.0002
   log_every: 50
   save_every: 500
   save_dir: "models"
+  # Optional expensive diagnostic: periodically generate real samples during training
+  # and compare their distribution to the training set. Leave at 0 to disable.
+  sample_diagnostics_every: 0
+  sample_diagnostics_num_samples: 128
+  # sample_diagnostics_n_steps: 1000
+  sample_diagnostics_seed: 0

@@ -189,7 +189,7 @@ class Diffusion:
             raise RuntimeError("trajectory capture unexpectedly returned no trajectory")
         return x, trajectory
 
-    def loss(self, x0: torch.Tensor) -> torch.Tensor:
+    def loss(self, x0: torch.Tensor, *, return_stats: bool = False) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
         """Training loss: predict the noise used to create x_t from x_0."""
         b = x0.shape[0]     # batch size B
         
@@ -200,4 +200,21 @@ class Diffusion:
         eps_pred = self.predict_eps(x_t, t) # predict ε_hat(x_t, t)
         
         # minimize mean squared error: ||ε_hat - ε||^2
-        return nn.functional.mse_loss(eps_pred, noise)
+        loss = nn.functional.mse_loss(eps_pred, noise)
+        if not return_stats:
+            return loss
+
+        sqrt_ab = self.sqrt_alphas_cumprod[t].unsqueeze(1)
+        sqrt_omab = self.sqrt_one_minus_alphas_cumprod[t].unsqueeze(1)
+        x0_pred = (x_t - sqrt_omab * eps_pred) / sqrt_ab.clamp_min(1e-8)
+
+        stats = {
+            "loss": float(loss.detach().item()),
+            "t_mean": float(t.float().mean().item()),
+            "t_std": float(t.float().std(unbiased=False).item()),
+            "x_t_std": float(x_t.detach().std(unbiased=False).item()),
+            "noise_std": float(noise.detach().std(unbiased=False).item()),
+            "eps_pred_std": float(eps_pred.detach().std(unbiased=False).item()),
+            "x0_pred_mse": float(nn.functional.mse_loss(x0_pred, x0).detach().item()),
+        }
+        return loss, stats

@@ -7,7 +7,7 @@ model:
   checkpoint: "models/diffusion_final.pt"
 
 sampling:
-  num_samples: 64
+  num_samples: 1000 #64
   # Optional inference-time override (must be <= checkpoint diffusion.n_steps)
   # n_steps: 25
   out_path: "data/processed/samples.npz"
@@ -17,3 +17,9 @@ sampling:
   #   sample_index: 0
   #   max_frames: 120
   #   fps: 12
+  # Diagnostics are enabled by default and written next to samples as
+  # data/processed/samples.diagnostics.json. Override here if needed.
+  # diagnostics:
+  #   enabled: true
+  #   out_path: "data/processed/samples.diagnostics.json"
+  #   reference_data_path: "data/raw/hexagons.npz"

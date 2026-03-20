@@ -64,6 +64,16 @@ pip install -e .[dev]
 python -m polydiff.training.train --config configs/train_diffusion.yaml
 ```
 
+Training now writes:
+- `models/train.log`: human-readable training log
+- `models/train_metrics.jsonl`: structured per-step metrics for plotting/debugging
+
+Logged training metrics include loss, EMA loss, gradient norm, parameter norm, timestep stats, and a cheap `x0_pred_mse` denoising proxy.
+Checkpoints also store the training data path and a summary of the training data distribution so later sampling runs can compare against it automatically.
+
+If you want true generative diagnostics during training, set `training.sample_diagnostics_every` in `configs/train_diffusion.yaml`.
+This is intentionally off by default because it is much more expensive than ordinary training logs.
+
 **Sampling**
 ```bash
 python -m polydiff.sampling.sample --config configs/sample_diffusion.yaml
@@ -77,6 +87,14 @@ sampling:
   out_path: "data/processed/samples.npz"
 ```
 `sampling.n_steps` must be between `1` and the checkpoint's trained diffusion steps.
+
+Sampling also writes a JSON diagnostics report next to the `.npz` output by default, for example:
+- `data/processed/samples.diagnostics.json`
+
+That report includes:
+- generated sample summary metrics
+- reference training summary metrics when available
+- generated-minus-reference deltas to highlight drift in score, edge/angle/radius CV, compactness, centering, scale, and self-intersection rate
 
 To save a GIF of one polygon denoising from pure noise to the final sample:
 ```bash
