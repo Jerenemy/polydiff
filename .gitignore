@@ -40,3 +40,5 @@ pretrained_models/*.pt
 
 # testing
 testpkg/
+
+*.jsonl
