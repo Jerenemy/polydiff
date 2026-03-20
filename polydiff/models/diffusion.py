@@ -100,6 +100,10 @@ class DenoiseGAT(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
         )
+        self.global_gate = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Sigmoid(),
+        )
         self.node_head = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.SiLU(),
@@ -159,7 +163,9 @@ class DenoiseGAT(nn.Module):
         node_hidden = node_hidden.reshape(batch_size, self.num_vertices, -1)
         global_features = self.global_head(node_hidden.mean(dim=1))
         global_features = global_features.unsqueeze(1).expand(-1, self.num_vertices, -1)
-        node_noise = self.node_head(torch.cat([node_hidden, global_features], dim=-1).reshape(batch_size * self.num_vertices, -1))
+        global_gate = self.global_gate(torch.cat([node_hidden, global_features], dim=-1))
+        gated_global = global_gate * global_features
+        node_noise = self.node_head(torch.cat([node_hidden, gated_global], dim=-1).reshape(batch_size * self.num_vertices, -1))
         return node_noise.reshape(batch_size, self.data_dim)
 
 

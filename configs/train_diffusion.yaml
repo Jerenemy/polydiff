@@ -16,12 +16,12 @@ model:
   num_layers: 3
 
 diffusion:
-  n_steps: 50
+  n_steps: 20
   beta_start: 0.0001
   beta_end: 0.02
 
 training:
-  epochs: 60
+  epochs: 30
   lr: 0.0002
   log_every: 50
   save_every: 500
