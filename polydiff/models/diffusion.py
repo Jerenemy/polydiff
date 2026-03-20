@@ -96,8 +96,12 @@ class DenoiseGAT(nn.Module):
             num_features_per_layer=num_features_per_layer,
             dropout=0.0,
         )
-        self.node_head = nn.Sequential(
+        self.global_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+        )
+        self.node_head = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, self.coord_dim),
         )
@@ -152,7 +156,10 @@ class DenoiseGAT(nn.Module):
         node_features = torch.cat([coords, pos_enc, time_emb], dim=-1).reshape(batch_size * self.num_vertices, -1)
         edge_index = self._batched_edge_index(batch_size, x.device)
         node_hidden, _ = self.gat((node_features, edge_index))
-        node_noise = self.node_head(node_hidden)
+        node_hidden = node_hidden.reshape(batch_size, self.num_vertices, -1)
+        global_features = self.global_head(node_hidden.mean(dim=1))
+        global_features = global_features.unsqueeze(1).expand(-1, self.num_vertices, -1)
+        node_noise = self.node_head(torch.cat([node_hidden, global_features], dim=-1).reshape(batch_size * self.num_vertices, -1))
         return node_noise.reshape(batch_size, self.data_dim)
 
 
