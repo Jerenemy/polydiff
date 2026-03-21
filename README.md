@@ -1,144 +1,576 @@
 # Polydiff
 
-DDPM diffusion model to generate 2D polygons. This repo is structured for clean data generation, repeatable experiments, and easy debugging.
+DDPM diffusion models for generating 2D polygons. The repo now supports multiple denoisers behind the same training and sampling pipeline:
 
-**Structure**
-- `polydiff/`: Python package (importable code)
-- `scripts/`: CLI entrypoints
+- `mlp`: a flattened-vector baseline
+- `gat`: a graph attention denoiser over the polygon cycle graph
+- `gcn`: a simple graph convolution denoiser over the same cycle graph
+
+The code is organized so data generation, model selection, training, sampling, and diagnostics can all be changed independently.
+
+## Structure
+
+- `polydiff/`: importable package code
 - `configs/`: YAML configs for training and sampling
-- `data/`: generated data and outputs
-- `models/`: local training artifacts and checkpoints
+- `scripts/`: CLI wrappers
+- `data/`: raw datasets and generated samples
+- `models/`: local checkpoints and logs
 - `pretrained_models/`: externally trained checkpoints
-- `notebooks/`: exploratory debugging and visualization
+- `notebooks/`: exploratory analysis
 - `tests/`: pytest tests
 
-**Quick Start**
+## Quick Start
+
 1. Create an environment
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e .[dev] # or: poetry install
+pip install -e .[dev]
 ```
 
-2. Generate polygons (saved to `data/raw/` by default)
+2. Generate polygons
+
 ```bash
 python -m polydiff.data.gen_polygons --n 6 --num 10000 --out hexagons.npz
 ```
 
-Control how noisy/irregular generated polygons are:
-- Less noisy (closer to regular polygons): lower `--radial_sigma` and `--angle_sigma`, optionally increase `--smooth_passes`.
-- More noisy (more irregular polygons): raise `--radial_sigma` and `--angle_sigma`, optionally reduce `--smooth_passes`.
+Important details about the generated data:
+
+- Each polygon is generated from a random start angle `theta0`.
+- Vertices are then placed around the cycle with smooth radial and angular perturbations.
+- The raw generator recenters each polygon, RMS-normalizes its scale, and enforces CCW orientation.
+- The generator does not anchor the polygon to a fixed start vertex.
+
+Control how irregular the polygons are:
+
+- Lower `--radial_sigma` and `--angle_sigma` for more regular polygons.
+- Raise them for more irregular polygons.
+- Increase `--smooth_passes` for smoother deformations.
 
 Examples:
+
 ```bash
-# Less noisy
+# cleaner polygons
 python -m polydiff.data.gen_polygons \
   --n 6 --num 10000 --out hexagons_clean.npz \
   --radial_sigma 0.08 --angle_sigma 0.04 --smooth_passes 5
 
-# More noisy
+# rougher polygons
 python -m polydiff.data.gen_polygons \
   --n 6 --num 10000 --out hexagons_noisy.npz \
   --radial_sigma 0.30 --angle_sigma 0.20 --smooth_passes 1 --deform_dist uniform
 ```
 
-3. Visualize polygons
+3. Plot polygons
+
 ```bash
 python -m polydiff.data.plot_polygons hexagons.npz --num 16
 ```
 
 Notes:
-- Training/generated `.npz` files include stored `score`, so polygons are colored by score by default.
-- Use `--show_scores` to draw numeric score labels on each subplot.
+
+- Training `.npz` files usually contain stored `score`, so polygons are colored by score by default.
+- Use `--show_scores` to render numeric score labels.
 
 4. Run tests
+
 ```bash
 pytest
 ```
 
-**Training (DDPM)**
-Install the ML deps and run training:
+## Training
+
 ```bash
-pip install -e .[dev]
-# torch + pyyaml are in core deps
 python -m polydiff.training.train --config configs/train_diffusion.yaml
 ```
 
-Training now writes:
-- `models/train.log`: human-readable training log
-- `models/train_metrics.jsonl`: structured per-step metrics for plotting/debugging
+The training config now chooses the denoiser explicitly:
 
-Logged training metrics include loss, EMA loss, gradient norm, parameter norm, timestep stats, and a cheap `x0_pred_mse` denoising proxy.
-Checkpoints also store the training data path and a summary of the training data distribution so later sampling runs can compare against it automatically.
+```yaml
+model:
+  type: gat   # mlp | gat | gcn
+  hidden_dim: 256
+  time_emb_dim: 64
+  num_layers: 3
+```
 
-If you want true generative diagnostics during training, set `training.sample_diagnostics_every` in `configs/train_diffusion.yaml`.
-This is intentionally off by default because it is much more expensive than ordinary training logs.
+Training writes:
 
-**Sampling**
+- `models/train.log`: human-readable logs
+- `models/train_metrics.jsonl`: structured per-step metrics
+- `models/diffusion_final.pt`: final checkpoint
+
+Checkpoints store:
+
+- model weights
+- diffusion schedule
+- `model_cfg`
+- `n_vertices`
+- training data path
+- training data summary statistics
+
+That means sampling rebuilds the same denoiser architecture from the checkpoint automatically. You do not have to restate `model.type` in `configs/sample_diffusion.yaml`; the checkpoint drives reconstruction.
+
+Logged metrics include:
+
+- loss
+- EMA loss
+- gradient norm
+- parameter norm
+- timestep statistics
+- `eps_pred_std`
+- `noise_std`
+- `x0_pred_mse`
+
+Optional expensive generative diagnostics can be enabled during training with `training.sample_diagnostics_every`.
+
+Relevant files:
+
+- [`configs/train_diffusion.yaml`](configs/train_diffusion.yaml) lines 12-16 define `model.type`, `hidden_dim`, `time_emb_dim`, and `num_layers`.
+- [`polydiff/training/train.py`](polydiff/training/train.py) lines 52-54 read `model_cfg` and call `build_denoiser(...)`.
+- [`polydiff/models/diffusion.py`](polydiff/models/diffusion.py) lines 260-288 dispatch `mlp`, `gat`, or `gcn`.
+
+## Sampling
+
 ```bash
 python -m polydiff.sampling.sample --config configs/sample_diffusion.yaml
 ```
 
-To sample with fewer reverse steps, set `sampling.n_steps` in `configs/sample_diffusion.yaml`:
+The sampling config points to a checkpoint:
+
 ```yaml
-sampling:
-  num_samples: 64
-  n_steps: 250
-  out_path: "data/processed/samples.npz"
-```
-`sampling.n_steps` must be between `1` and the checkpoint's trained diffusion steps.
-
-Sampling also writes a JSON diagnostics report next to the `.npz` output by default, for example:
-- `data/processed/samples.diagnostics.json`
-
-That report includes:
-- generated sample summary metrics
-- reference training summary metrics when available
-- generated-minus-reference deltas to highlight drift in score, edge/angle/radius CV, compactness, centering, scale, and self-intersection rate
-
-To save a GIF of one polygon denoising from pure noise to the final sample:
-```bash
-poetry add pillow
-
-python -m polydiff.sampling.sample \
-  --config configs/sample_diffusion.yaml \
-  --save_animation data/processed/sample_trajectory.gif
+model:
+  checkpoint: "models/diffusion_final.pt"
 ```
 
-Animation options:
-- `--animation_index`: which sample in the batch to animate (default `0`)
-- `--animation_max_frames`: cap encoded frames to keep GIF size reasonable (default `120`)
-- `--animation_fps`: playback speed for the GIF (default `12`)
-- The same settings can also live under `sampling.animation` in the sampling config.
+Sampling writes:
 
-Visualize sampled outputs:
-```bash
-# samples are written to data/processed/samples.npz by default
-python -m polydiff.data.plot_polygons data/processed/samples.npz --num 16
+- `data/processed/samples.npz`
+- `data/processed/samples.diagnostics.json` by default
 
-# for sampled files (no stored score), compute and show scores at plot time
-python -m polydiff.data.plot_polygons data/processed/samples.npz --num 16 --compute_score
+The diagnostics JSON compares generated samples against the training reference distribution when that reference is available from the checkpoint or explicitly configured.
+
+Reduced-step sampling is supported with `sampling.n_steps`, but the current implementation uses naive schedule truncation rather than a respaced sampler. For architecture comparisons, full-step sampling is the cleanest reference.
+
+Relevant files:
+
+- [`configs/sample_diffusion.yaml`](configs/sample_diffusion.yaml) lines 6-13 define checkpoint loading and sampling options.
+- [`polydiff/sampling/runtime.py`](polydiff/sampling/runtime.py) lines 50-70 rebuild the denoiser from the checkpoint's stored `model_cfg`.
+
+## Diffusion Math
+
+All three denoisers plug into the same DDPM wrapper in [`polydiff/models/diffusion.py`](polydiff/models/diffusion.py).
+
+Intuition:
+
+- Training picks a clean polygon `x_0`, adds a known amount of Gaussian noise, and asks the denoiser to predict exactly which noise was added.
+- Sampling starts from pure noise and repeatedly subtracts the model's estimated noise.
+- The denoiser architecture changes how the model reasons about polygon structure, but not the diffusion math around it.
+
+Core equations:
+
+```text
+q(x_t | x_0) = N(sqrt(bar_alpha_t) * x_0, (1 - bar_alpha_t) I)
+x_t = sqrt(bar_alpha_t) * x_0 + sqrt(1 - bar_alpha_t) * eps
+eps ~ N(0, I)
 ```
 
-**CLI Wrappers**
-If you prefer scripts instead of `-m` modules:
-```bash
-python scripts/generate_data/gen_polygons.py --n 6 --num 10000 --out hexagons.npz
-python scripts/generate_data/plot_polygons.py hexagons.npz --num 16
-python scripts/train_diffusion.py --config configs/train_diffusion.yaml
-python scripts/sample_diffusion.py --config configs/sample_diffusion.yaml
+Training objective:
+
+```text
+L_simple = E[ || eps - eps_theta(x_t, t) ||^2 ]
 ```
 
-**Data Conventions**
-- If `--out` or input filenames are bare (no path), they resolve to `data/raw/`.
-- Keep large files out of git unless using Git LFS.
+Reverse step used at sampling time:
 
-**Debugging**
-Use `notebooks/` for exploratory work and fast iteration. Keep notebook outputs small.
+```text
+mu_theta(x_t, t) = (1 / sqrt(alpha_t)) * (x_t - (beta_t / sqrt(1 - bar_alpha_t)) * eps_theta(x_t, t))
+x_{t-1} = mu_theta(x_t, t) + sqrt(tilde_beta_t) * z
+z ~ N(0, I)
+```
 
+Relevant code:
 
+- [`polydiff/models/diffusion.py`](polydiff/models/diffusion.py) lines 299-339 build the diffusion schedule.
+- [`polydiff/models/diffusion.py`](polydiff/models/diffusion.py) lines 347-353 implement `q_sample(...)`.
+- [`polydiff/models/diffusion.py`](polydiff/models/diffusion.py) lines 358-379 implement one reverse step `p_sample(...)`.
+- [`polydiff/models/diffusion.py`](polydiff/models/diffusion.py) lines 427-455 implement the training loss and diagnostic stats.
 
-whats the analogy for adding in the context of the target protein? 
-does the message passing go between the molecule and the protein? 
-how do the features get added into the molecule (like the rd kit features)?
-how to add in the atom type
+## Denoisers
+
+All denoisers implement the same interface:
+
+- input `x_t`: shape `(B, D)` where `D = 2 * n_vertices`
+- input `t`: shape `(B,)`
+- output: predicted noise with shape `(B, D)`
+
+The diffusion wrapper itself does not care which denoiser is underneath. The architectural differences are entirely in how the model converts `(x_t, t)` into a noise prediction.
+
+### `DenoiseMLP`
+
+Relevant code:
+
+- [`polydiff/models/diffusion.py`](polydiff/models/diffusion.py) lines 34-57
+
+Intuition:
+
+- Treat the polygon as one long vector.
+- Give the network the noisy coordinates and a description of "what timestep am I at?"
+- Let a standard MLP learn the mapping from noisy polygon to predicted noise.
+
+Math view:
+
+```text
+phi(t) = SiLU(W_t * SinusoidalPosEmb(t))
+eps_hat = f_MLP([x_t ; phi(t)])
+```
+
+Features used:
+
+1. Every noisy coordinate in the flattened polygon vector
+2. One timestep embedding for the whole polygon
+
+Architecture:
+
+1. Build `phi(t)` with `SinusoidalPosEmb -> Linear -> SiLU`
+2. Concatenate `[x_t ; phi(t)]`
+3. Run `num_layers` hidden `Linear -> SiLU` blocks
+4. Project back to `data_dim`
+
+Why it is still useful:
+
+- simplest baseline
+- full global receptive field immediately
+- easy to debug against the graph models
+
+Current limitations:
+
+- no explicit graph structure
+- no local neighborhood bias
+- depends on stable vertex ordering
+- not permutation-equivariant
+- not E(2)-equivariant
+
+### `DenoiseGAT`
+
+Relevant code:
+
+- Wrapper and feature construction: [`polydiff/models/diffusion.py`](polydiff/models/diffusion.py) lines 59-169
+- Attention implementation: [`polydiff/models/gat.py`](polydiff/models/gat.py) lines 6-303
+
+Intuition:
+
+- Turn the polygon into a ring graph where each vertex can talk to itself and its two immediate neighbors.
+- Give each vertex its current noisy coordinates, its place on the ring, and the diffusion timestep.
+- Use attention to decide which neighboring messages matter more for the current denoising step.
+- After local message passing, add a coarse whole-polygon summary and let each node decide how much of that global context to use.
+
+Math view:
+
+Initial node features for vertex `k`:
+
+```text
+h_k^(0) = [x_k, y_k,
+           sin(2*pi*k/n), cos(2*pi*k/n),
+           sin(4*pi*k/n), cos(4*pi*k/n),
+           phi(t)]
+```
+
+where `phi(t)` is the shared timestep embedding.
+
+Cycle graph:
+
+```text
+E = {(k, k), (k, k+1 mod n), (k, k-1 mod n)}
+```
+
+Inside one GAT layer, with source node `u` and target node `v`:
+
+```text
+z_u = W h_u
+e_uv = LeakyReLU(a_src^T z_u + a_trg^T z_v)
+alpha_uv = softmax_{u in N(v)}(e_uv)
+m_v = sum_{u in N(v)} alpha_uv * z_u
+```
+
+Then the implementation applies skip connections and head concat or averaging inside the layer.
+
+After the GAT stack:
+
+```text
+g = psi(mean_k h_k^(L))
+gamma_k = sigmoid(W_g [h_k^(L) ; g])
+eps_hat_k = MLP([h_k^(L) ; gamma_k odot g])
+```
+
+where `psi` is `global_head`, `gamma_k` is the node-wise gate, and the final MLP predicts 2 numbers per node.
+
+Every feature currently given to the GAT:
+
+1. Noisy `x` coordinate
+2. Noisy `y` coordinate
+3. `sin(2 * pi * k / n)`
+4. `cos(2 * pi * k / n)`
+5. `sin(4 * pi * k / n)`
+6. `cos(4 * pi * k / n)`
+7. The timestep embedding `phi(t)` repeated at every node
+8. A pooled graph feature after message passing, injected back through the gated global path
+
+Important architectural details:
+
+- Intermediate layers use 4 heads when `hidden_dim >= 4`, otherwise 1 head.
+- The final GAT layer uses 1 head and outputs a `hidden_dim` vector per node.
+- Skip connections are already enabled inside the imported `GAT` implementation.
+- The wrapper sets GAT dropout to `0.0`.
+- There are still no explicit edge features.
+
+Why these features help, intuitively:
+
+- Coordinates tell the model what the noisy polygon currently looks like.
+- Time embedding tells it how hard the denoising step should be.
+- Cycle harmonics tell it where a node sits around the ring without tying that position to absolute world-space orientation.
+- The pooled global feature gives a coarse "what kind of polygon is this overall?" summary.
+- The gate stops that global summary from being used at full strength everywhere.
+
+Current concerns and limitations:
+
+- The topology is still only local cycle edges plus self-loops.
+- Global shape has to emerge through multi-hop local propagation, except for the coarse pooled summary.
+- The pooled summary can reduce outliers but also reduce variance if it dominates.
+- There are no long-range edges, no opposite-vertex connections, and no edge geometry features.
+- The positional features are fixed, not learned.
+- The model is still not E(2)-equivariant.
+- It still assumes stable cyclic ordering.
+
+### `DenoiseGCN`
+
+Relevant code:
+
+- Wrapper and graph construction: [`polydiff/models/diffusion.py`](polydiff/models/diffusion.py) lines 172-257
+- Base graph convolution: [`polydiff/models/gcn.py`](polydiff/models/gcn.py) lines 8-34
+
+Intuition:
+
+- This is the simplest graph baseline: each node repeatedly averages information from itself and its two immediate neighbors.
+- Residuals keep the node state from being replaced entirely by that local average.
+- A small per-node MLP makes the final `(x, y)` prediction after message passing.
+
+Math view:
+
+Initial node features:
+
+```text
+h_k^(0) = [x_k, y_k, phi(t)]
+```
+
+Adjacency:
+
+```text
+A_{k,k} = A_{k,k+1} = A_{k,k-1} = 1/3
+```
+
+One residual GCN block is:
+
+```text
+tilde_h^(l+1) = A h^(l) W_l + b_l
+h^(l+1) = SiLU(tilde_h^(l+1) + R_l(h^(l)))
+```
+
+where `R_l` is either identity or a learned linear projection.
+
+Final node prediction:
+
+```text
+eps_hat_k = MLP(h_k^(L))
+```
+
+Every feature currently given to the GCN:
+
+1. Noisy `x` coordinate
+2. Noisy `y` coordinate
+3. The timestep embedding `phi(t)` repeated at every node
+
+What it does not currently get:
+
+- cycle positional features
+- pooled global features
+- edge features
+- long-range edges
+
+Architecture details:
+
+- `num_layers` graph convolutions
+- residual path around every graph convolution
+- shared `SiLU` after each residual block
+- per-node head `Linear -> SiLU -> Linear`
+
+Current concerns and limitations:
+
+- The core message passing is still a local averaging operator, so oversmoothing is the central risk.
+- In current experiments this model has been much less successful than the GAT and often plateaued early.
+- Residuals and the node MLP help, but they do not change the basic low-pass nature of the graph convolution.
+- No positional features and no global path means the model has weak symmetry-breaking and weak whole-graph context.
+
+## Denoiser Selection and Checkpoint Behavior
+
+Training chooses the denoiser with `model.type`:
+
+- `mlp`
+- `gat`
+- `gcn`
+
+This is implemented through `build_denoiser(...)` in `polydiff/models/diffusion.py`.
+
+The checkpoint stores `model_cfg`, and sampling reconstructs the denoiser from that stored config before loading weights. That makes the train and sample paths architecture-consistent by default.
+
+One consequence is that architecture edits can make old checkpoints incompatible if parameter shapes change. That is expected for the recent GAT and GCN experiments.
+
+## Current Architectural Concerns
+
+Across all three denoisers, the main open issues are:
+
+- no E(2)-equivariant geometry handling
+- reliance on fixed cyclic ordering
+- no explicit edge features
+- no learned mechanism for long-range polygon relationships
+- DDPM MSE training can reward safe average predictions even when sample diversity is too low
+
+Architecture-specific concerns:
+
+- `mlp`: weak inductive bias but full global access
+- `gat`: better local structure modeling but still prone to either unstable tails or over-regularized samples depending on how global context is injected
+- `gcn`: simplest graph baseline, but currently the least convincing denoiser because of oversmoothing
+
+Relevant code:
+
+- [`polydiff/models/diffusion.py`](polydiff/models/diffusion.py) lines 260-288 select the denoiser.
+- [`polydiff/training/train.py`](polydiff/training/train.py) lines 52-54 use that builder during training.
+- [`polydiff/sampling/runtime.py`](polydiff/sampling/runtime.py) lines 57-61 use the stored `model_cfg` during checkpoint loading.
+
+## Plausible Next Improvements
+
+These are the most natural next upgrades from the current codebase.
+
+### 1. Long-range graph edges
+
+Examples:
+
+- connect opposite vertices for even `n`
+- connect `k` to `k +/- 2`
+- use a denser graph than the simple cycle
+
+Why it may help:
+
+- gives nodes more direct access to whole-polygon structure
+- reduces the burden on multi-hop local propagation
+
+Concerns:
+
+- easy to overconstrain a tiny graph
+- the right edge pattern may depend on `n`
+- denser connectivity can wash out the interpretation of attention weights
+
+### 2. Learnable global context
+
+Examples:
+
+- global token node
+- attention pooling instead of mean pooling
+- lower-dimensional global bottleneck
+
+Why it may help:
+
+- richer graph-level summary than blunt mean pooling
+- could preserve diversity better than broadcasting a single large pooled vector
+
+Concerns:
+
+- still can collapse toward mean-shape behavior if the global path dominates
+- introduces more moving parts into an already sensitive generative setup
+
+### 3. Richer positional information
+
+Examples:
+
+- more harmonics
+- learnable circular embeddings
+- canonicalized start vertex plus learned index embeddings
+
+Why it may help:
+
+- lets the model coordinate vertex roles around the ring more precisely
+
+Concerns:
+
+- naive learned absolute index embeddings can encode fake semantics if the start vertex is arbitrary
+- more positional structure can make the model less robust to reindexing
+
+### 4. Edge features
+
+Examples:
+
+- relative displacement vectors
+- edge length
+- turning angle proxies
+- normalized pairwise distance features
+
+Why it may help:
+
+- gives message passing explicit geometric relationships rather than topology alone
+
+Concerns:
+
+- feature design can accidentally leak preprocessing assumptions
+- some edge features are not naturally invariant or equivariant without extra care
+
+### 5. Equivariant geometry models
+
+Examples:
+
+- EGNN-style updates
+- E(2)-equivariant message passing
+
+Why it may help:
+
+- better inductive bias for coordinate prediction
+- less need to learn geometric symmetries from scratch
+
+Concerns:
+
+- more implementation complexity
+- interaction with the repo's existing centering / scale normalization / canonicalization should be thought through carefully
+
+### 6. Better normalization and residual design
+
+Examples:
+
+- layer norm or graph norm
+- stronger residual mixing
+- pre-norm attention blocks
+
+Why it may help:
+
+- could stabilize training and reduce outlier trajectories
+
+Concerns:
+
+- easy to add complexity without fixing the real missing inductive bias
+- can improve optimization while still leaving sample quality bottlenecked by topology and features
+
+## Debugging and Diagnostics
+
+Use `notebooks/` for exploratory work. The repo also has automatic dataset and sample diagnostics for:
+
+- regularity score
+- edge, angle, and radius coefficient of variation
+- compactness
+- centering drift
+- scale drift
+- self-intersection rate
+
+When looking at aligned diagnostic plots, remember that canonicalization intentionally anchors one vertex and rotates the polygon to a standard orientation. Those plots are useful for distribution comparison, but they are not raw geometry views.
+
+Relevant code:
+
+- [`polydiff/data/diagnostics.py`](polydiff/data/diagnostics.py) lines 21-41 define canonicalization used by many diagnostics.

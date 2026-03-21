@@ -1,215 +1,575 @@
 # `polydiff/models/diffusion.py` Reference
 
-This document explains each class and function in `polydiff/models/diffusion.py`, including purpose, tensor shapes, and the DDPM math it implements.
+This document explains the current diffusion stack and all three denoisers:
+
+- `DenoiseMLP`
+- `DenoiseGAT`
+- `DenoiseGCN`
+
+It is meant to answer three different questions at once:
+
+1. What is the model doing intuitively?
+2. What equations is it trying to approximate?
+3. Where is the corresponding code?
+
+## Source Map
+
+Main files:
+
+- [`diffusion.py`](diffusion.py) lines 15-455: timestep embedding, denoisers, denoiser builder, and DDPM wrapper
+- [`gat.py`](gat.py) lines 6-303: graph attention implementation used by `DenoiseGAT`
+- [`gcn.py`](gcn.py) lines 8-34: base `GraphConvolution` used by `DenoiseGCN`
+
+Train/sample integration:
+
+- [`../training/train.py`](../training/train.py) lines 52-54: read `model_cfg` and build the denoiser
+- [`../sampling/runtime.py`](../sampling/runtime.py) lines 57-61: rebuild the denoiser from checkpoint `model_cfg`
+
+Configs:
+
+- [`../../configs/train_diffusion.yaml`](../../configs/train_diffusion.yaml) lines 12-16: choose `model.type`, `hidden_dim`, `time_emb_dim`, `num_layers`
+- [`../../configs/sample_diffusion.yaml`](../../configs/sample_diffusion.yaml) lines 6-13: choose checkpoint and sampling options
 
 ## Notation
 
 - `B`: batch size
-- `D`: flattened data dimension (for polygons, typically `2 * n_vertices`)
-- `t`: diffusion timestep index in `{0, 1, ..., T-1}`
-- `T`: total number of diffusion steps (`n_steps`)
-- `beta_t`: forward-process variance schedule
+- `n`: number of polygon vertices
+- `D = 2n`: flattened polygon dimension
+- `x_0`: clean polygon
+- `x_t`: polygon after adding noise at timestep `t`
+- `eps`: Gaussian noise used in the forward process
+- `eps_theta(x_t, t)`: model prediction of that noise
+- `T`: number of diffusion steps
+- `beta_t`: noise variance added at step `t`
 - `alpha_t = 1 - beta_t`
 - `bar_alpha_t = prod_{s=0}^t alpha_s`
 
-All vectors are assumed row-major batched tensors:
-- `x0, x_t, noise`: shape `(B, D)`
-- `t`: shape `(B,)`
+Unless stated otherwise:
 
-## `class SinusoidalPosEmb(nn.Module)`
+- flattened polygon tensors have shape `(B, D)`
+- per-node graph tensors have shape `(B, n, F)` before batching graphs together
 
-### Purpose
-Convert scalar timesteps into continuous embeddings that let the denoiser condition on diffusion time.
+## `SinusoidalPosEmb`
 
-### `__init__(dim: int)`
-- Stores embedding output dimension `dim`.
+Relevant code:
 
-### `forward(t: torch.Tensor) -> torch.Tensor`
-Input:
-- `t`: `(B,)`, integer or float timesteps.
+- [`diffusion.py`](diffusion.py) lines 15-31
 
-Output:
-- `(B, dim)` sinusoidal embedding.
+### Intuition
 
-Math:
-1. Let `half = floor(dim / 2)`.
-2. Construct frequencies
-   `omega_i = exp(-log(10000) * i / (half - 1))`, for `i = 0 ... half-1`.
-3. Form phase matrix `phi_{b,i} = t_b * omega_i`.
-4. Return concatenation
-   `[sin(phi), cos(phi)]` along feature axis.
-5. If `dim` is odd, append one zero feature to keep exact width.
+The denoiser needs to know whether it is removing a tiny amount of noise near the end of sampling or a large amount of noise near the beginning. `SinusoidalPosEmb` turns the scalar timestep `t` into a vector with multiple frequencies so downstream layers can tell those regimes apart.
 
-Interpretation:
-- Lower `i` gives slower oscillations, higher `i` gives faster oscillations.
-- This is the standard transformer-style positional/time embedding adapted for diffusion timesteps.
+### Math
 
-## `class DenoiseMLP(nn.Module)`
+For embedding width `d`, let `half = floor(d / 2)` and define frequencies
 
-### Purpose
-Predict additive Gaussian noise `epsilon` from noisy sample `x_t` and timestep `t`.
+```text
+omega_i = exp(-log(10000) * i / (half - 1)),   i = 0, ..., half - 1
+```
 
-### `__init__(data_dim: int, hidden_dim: int, time_emb_dim: int, num_layers: int)`
-Builds two parts:
-1. `time_mlp`:
-   - `SinusoidalPosEmb(time_emb_dim)`
-   - `Linear(time_emb_dim -> time_emb_dim)`
-   - `SiLU`
-2. `net`:
-   - Input width: `data_dim + time_emb_dim`
-   - `num_layers` hidden blocks (`Linear -> SiLU`) with width `hidden_dim`
-   - Final `Linear(hidden_dim -> data_dim)`
+Then for sample `b`:
 
-Notes:
-- `max(1, num_layers)` guarantees at least one hidden layer.
+```text
+phi_b = [sin(t_b * omega_0), ..., sin(t_b * omega_{half-1}),
+         cos(t_b * omega_0), ..., cos(t_b * omega_{half-1})]
+```
 
-### `forward(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor`
-Input:
-- `x`: `(B, data_dim)` noisy sample.
-- `t`: `(B,)` timestep.
+If `d` is odd, one zero is appended to keep the width exact.
 
-Output:
-- `(B, data_dim)` predicted noise `epsilon_theta(x_t, t)`.
+### What the code does
 
-Computation:
-1. `emb = time_mlp(t)` -> `(B, time_emb_dim)`
-2. Concatenate `[x, emb]` -> `(B, data_dim + time_emb_dim)`
-3. Feed through `net`.
+- Builds the frequency vector in [`diffusion.py`](diffusion.py) lines 23-28
+- Concatenates sine and cosine features in [`diffusion.py`](diffusion.py) lines 28-30
 
-## `@dataclass DiffusionConfig`
+## `DenoiseMLP`
 
-### Purpose
-Container for scalar hyperparameters controlling the diffusion schedule.
+Relevant code:
 
-Fields:
-- `n_steps: int = 1000` -> total diffusion steps `T`
-- `beta_start: float = 1e-4` -> `beta_0`
-- `beta_end: float = 2e-2` -> `beta_{T-1}`
+- [`diffusion.py`](diffusion.py) lines 34-57
 
-Schedule:
-- `beta_t` is linearly interpolated from `beta_start` to `beta_end`.
+### Intuition
 
-## `class Diffusion`
+This is the baseline that ignores graph structure. It treats the whole polygon as one long coordinate vector and asks a standard MLP to infer the noise directly from that vector plus the timestep.
 
-### Purpose
-Wrap DDPM forward process, reverse sampling, and training objective around a noise-predicting model.
+This is a reasonable baseline when:
 
-### `__init__(model: nn.Module, config: DiffusionConfig, device: Optional[torch.device] = None)`
-Initializes model and precomputes schedule tensors on `device`.
+- the polygon always has the same number of vertices
+- the vertex ordering is consistent
+- you want the simplest possible denoiser first
 
-Precomputed quantities:
-1. `betas = linspace(beta_start, beta_end, T)`
-2. `alphas = 1 - betas`
-3. `alphas_cumprod[t] = bar_alpha_t = prod_{s=0}^t alpha_s`
-4. `alphas_cumprod_prev[t] = bar_alpha_{t-1}`, with `bar_alpha_{-1} := 1`
-5. `sqrt_alphas_cumprod[t] = sqrt(bar_alpha_t)`
-6. `sqrt_one_minus_alphas_cumprod[t] = sqrt(1 - bar_alpha_t)`
-7. `sqrt_recip_alphas[t] = 1 / sqrt(alpha_t)`
-8. Posterior variance
-   `posterior_variance[t] = beta_t * (1 - bar_alpha_{t-1}) / (1 - bar_alpha_t)`
+### Features
 
-These are the standard DDPM closed-form coefficients.
+The MLP sees exactly two kinds of information:
 
-### `q_sample(x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor`
-Purpose:
-- Sample forward noised data `x_t` from clean data `x_0` at arbitrary timestep `t`.
+1. the full flattened noisy polygon `x_t`
+2. one shared timestep embedding `phi(t)`
 
-Math:
-- `q(x_t | x_0) = N(sqrt(bar_alpha_t) * x_0, (1 - bar_alpha_t) I)`
-- Implemented as
-  `x_t = sqrt(bar_alpha_t) * x_0 + sqrt(1 - bar_alpha_t) * noise`,
-  where `noise ~ N(0, I)`.
+It does not see:
 
-### `predict_eps(x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor`
-Purpose:
-- Thin wrapper calling the denoiser model:
-  `epsilon_theta = model(x_t, t)`.
+- explicit adjacency
+- local neighborhoods
+- per-vertex positional encodings
+- pooled global graph features
 
-### `p_sample(x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor`
-Purpose:
-- One reverse diffusion step `x_t -> x_{t-1}`.
+### Math
 
-DDPM reverse parameterization:
-- `p_theta(x_{t-1} | x_t) = N(mu_theta(x_t, t), tilde_beta_t I)`
-- With epsilon-prediction form:
-  `mu_theta = (1 / sqrt(alpha_t)) * (x_t - (beta_t / sqrt(1 - bar_alpha_t)) * epsilon_theta(x_t, t))`
-- `tilde_beta_t` is `posterior_variance[t]`.
+Let `phi(t)` be the learned timestep embedding produced by:
 
-Code mapping:
-1. Gather timestep coefficients (`beta_t`, `1/sqrt(alpha_t)`, `sqrt(1-bar_alpha_t)`).
-2. Compute `eps_pred = predict_eps(x_t, t)`.
-3. Compute `model_mean` via the equation above.
-4. If timestep is zero, return mean (deterministic final step).
-5. Else sample
-   `x_{t-1} = model_mean + sqrt(tilde_beta_t) * z`, `z ~ N(0, I)`.
+```text
+phi(t) = SiLU(W_t * SinusoidalPosEmb(t))
+```
 
-Implementation detail:
-- The `if t.min().item() == 0` branch assumes the whole batch shares the same timestep (true in `p_sample_loop`).
+Then the model is:
 
-### `p_sample_loop(shape: tuple[int, int]) -> torch.Tensor`
-Purpose:
-- Generate fresh samples from pure Gaussian noise by iterating reverse steps from `T-1` to `0`.
+```text
+eps_theta(x_t, t) = f_MLP([x_t ; phi(t)])
+```
 
-Algorithm:
-1. Start `x ~ N(0, I)` with given `shape`.
-2. For `step = T-1, ..., 0`:
-   - Create `t = [step, ..., step]` of shape `(B,)`.
-   - Apply `x = p_sample(x, t)`.
-3. Return final `x` as generated sample.
+where `[ ; ]` means concatenation.
 
-This implements ancestral DDPM sampling.
+### Architecture
 
-### `loss(x0: torch.Tensor) -> torch.Tensor`
-Purpose:
-- Training objective for epsilon-prediction DDPM.
+1. Build `phi(t)` using `SinusoidalPosEmb -> Linear -> SiLU`
+2. Concatenate `[x_t ; phi(t)]`
+3. Run `num_layers` hidden `Linear -> SiLU` blocks
+4. Project back to `D`
 
-Math:
-1. Sample random timestep `t ~ Uniform({0,...,T-1})` independently per sample.
-2. Sample `epsilon ~ N(0, I)`.
-3. Construct
-   `x_t = sqrt(bar_alpha_t) * x_0 + sqrt(1 - bar_alpha_t) * epsilon`.
-4. Predict `epsilon_theta(x_t, t)`.
-5. Optimize simple loss:
-   `L_simple = E[ ||epsilon - epsilon_theta(x_t, t)||_2^2 ]`.
+### Current limitations
 
-Code uses `nn.functional.mse_loss(eps_pred, noise)`, which is the standard simplified DDPM objective.
+- no graph inductive bias
+- depends on stable vertex ordering
+- no explicit permutation symmetry handling
+- no explicit geometric equivariance
 
-## Architecture Notes: GNN and Equivariance
+## `DenoiseGAT`
 
-### Does the current model use a GNN?
-No. The denoiser is `DenoiseMLP`, a fully connected MLP over a flattened polygon vector `(B, D)`.
-It does not perform message passing over polygon vertices/edges.
+Relevant code:
 
-### What this implies
-- Vertex structure is implicit (through fixed coordinate ordering), not explicit graph structure.
-- The model is not permutation-equivariant to vertex reindexing.
-- The model is not explicitly SE(2)/E(2)-equivariant (translations/rotations/reflections), although data preprocessing (centering, RMS scaling, CCW ordering) removes some nuisance variation.
+- Wrapper and feature assembly: [`diffusion.py`](diffusion.py) lines 59-169
+- Base GAT implementation: [`gat.py`](gat.py) lines 6-303
 
-### Should this be a GNN?
-For fixed-`n`, consistently ordered polygons, this MLP baseline is valid and simple.
-If sample quality, stability, or data efficiency becomes a bottleneck, a graph-based denoiser is usually a better inductive bias:
-- Nodes: vertices
-- Edges: polygon cycle (and optionally long-range edges)
-- Outputs: per-vertex 2D noise vectors
+### Intuition
 
-### Should it be equivariant?
-Usually yes for geometric generation tasks.
-An E(2)-equivariant denoiser can improve generalization and reduce the burden of learning rotational/reflection symmetries from data alone.
+This model treats the polygon as a ring graph. Each vertex can communicate with:
 
-Practical guidance:
-1. Keep current MLP for baseline/debug speed.
-2. Next upgrade: cycle-graph GNN denoiser.
-3. If geometry fidelity matters, move to an E(2)-equivariant GNN/EGNN-style denoiser.
+- itself
+- its previous neighbor
+- its next neighbor
 
-## End-to-End View
+The model is trying to do two things at once:
 
-Training:
-1. Corrupt clean samples with known Gaussian noise at random timestep.
-2. Train model to recover that noise.
+1. local cleanup: use nearby vertices to infer what a denoised local geometry should look like
+2. global coordination: use a pooled summary so the whole polygon stays coherent
 
-Sampling:
-1. Start from Gaussian noise.
-2. Apply learned reverse transition repeatedly to denoise.
+The GAT is meant to be a better inductive bias than the MLP because polygons really are graphs, not arbitrary flat vectors.
 
-Core assumption:
-- Data distribution can be recovered by learning reverse-time dynamics of a fixed forward Gaussian diffusion process.
+### Exact features given to each node
+
+For vertex index `k` in a polygon with `n` vertices, the initial node feature is:
+
+```text
+h_k^(0) = [x_k, y_k,
+           sin(2*pi*k/n), cos(2*pi*k/n),
+           sin(4*pi*k/n), cos(4*pi*k/n),
+           phi(t)]
+```
+
+So the node gets:
+
+1. noisy `x` coordinate
+2. noisy `y` coordinate
+3. first-harmonic sine position on the ring
+4. first-harmonic cosine position on the ring
+5. second-harmonic sine position on the ring
+6. second-harmonic cosine position on the ring
+7. the timestep embedding `phi(t)`, repeated at every node
+
+Relevant code:
+
+- timestep MLP: [`diffusion.py`](diffusion.py) lines 73-77
+- fixed cycle positional features: [`diffusion.py`](diffusion.py) lines 78-82 and 127-138
+- node feature concatenation: [`diffusion.py`](diffusion.py) lines 157-160
+
+### Why these features were chosen
+
+Intuition:
+
+- `(x_k, y_k)` tells the model what the current noisy polygon looks like.
+- `phi(t)` tells it how much denoising is needed at this timestep.
+- the sine/cosine cycle features tell it where the node sits around the ring
+
+The cycle features are important because without them, a high-noise cycle graph can look like an anonymous ring of almost interchangeable nodes.
+
+Why fixed instead of learned?
+
+- the polygon start vertex is not globally meaningful
+- fixed circular features give relative phase on the ring
+- they break symmetry without pretending vertex `0` has a stable world-space meaning
+
+### Graph topology
+
+The edge set is:
+
+```text
+E = {(k, k), (k, k+1 mod n), (k, k-1 mod n)}
+```
+
+So every node sees:
+
+- itself
+- one step clockwise
+- one step counterclockwise
+
+Relevant code:
+
+- cycle edge construction: [`diffusion.py`](diffusion.py) lines 114-125
+- batched edge index: [`diffusion.py`](diffusion.py) lines 140-148
+
+### Attention math
+
+Inside `GATLayer`, the implementation first projects node features:
+
+```text
+z_u = W h_u
+```
+
+Then for source node `u` and target node `v`, it computes an additive attention score:
+
+```text
+e_uv = LeakyReLU(a_src^T z_u + a_trg^T z_v)
+```
+
+and normalizes it over the neighborhood of `v`:
+
+```text
+alpha_uv = softmax_{u in N(v)}(e_uv)
+```
+
+Finally it aggregates:
+
+```text
+m_v = sum_{u in N(v)} alpha_uv * z_u
+```
+
+After that, the code applies:
+
+- skip connection
+- head concatenation or averaging
+- bias
+- activation on non-final layers
+
+Relevant code:
+
+- linear projection and scoring: [`gat.py`](gat.py) lines 82-103
+- neighborhood softmax: [`gat.py`](gat.py) lines 133-180
+- neighbor aggregation: [`gat.py`](gat.py) lines 182-193
+- residual/concat/bias handling: [`gat.py`](gat.py) lines 235-259
+- layer stack construction: [`gat.py`](gat.py) lines 271-295
+
+### Wrapper architecture
+
+The wrapper in `DenoiseGAT` chooses:
+
+- `num_layers` graph layers
+- 4 heads on intermediate layers if `hidden_dim >= 4`, otherwise 1
+- 1 final head
+- dropout `0.0` in the wrapper
+
+The output of the GAT stack is a hidden vector per node, not the final noise directly.
+
+Relevant code:
+
+- head count and hidden sizing: [`diffusion.py`](diffusion.py) lines 84-98
+
+### Gated pooled global feature
+
+After message passing, the model adds a graph-level summary:
+
+```text
+g = psi(mean_k h_k^(L))
+```
+
+where `psi` is `global_head`.
+
+Then each node decides how much of that summary to use:
+
+```text
+gamma_k = sigmoid(W_g [h_k^(L) ; g])
+g_k = gamma_k odot g
+```
+
+Finally:
+
+```text
+eps_hat_k = MLP([h_k^(L) ; g_k])
+```
+
+Intuition:
+
+- `mean_k h_k^(L)` asks: what is the average hidden state of this whole polygon?
+- `g` is a coarse whole-graph summary
+- `gamma_k` is a gate that stops every node from using the global summary equally
+- the final per-node MLP turns `[local hidden ; gated global]` into a 2D noise vector
+
+Relevant code:
+
+- global head: [`diffusion.py`](diffusion.py) lines 99-102
+- global gate: [`diffusion.py`](diffusion.py) lines 103-106
+- node head: [`diffusion.py`](diffusion.py) lines 107-111
+- forward pass for pooled global feature and gate: [`diffusion.py`](diffusion.py) lines 162-169
+
+### Current concerns
+
+1. The graph is still very local.
+   Even with several layers, global structure still has to emerge mostly through multi-hop local propagation.
+
+2. Mean-pooling is blunt.
+   It can suppress catastrophic outliers, but it can also shrink sample variance and pull generation toward average shapes.
+
+3. There are no explicit long-range edges.
+   Opposite or multi-hop relationships are not encoded directly.
+
+4. There are no edge features.
+   Messages only know the graph topology, not relative displacement, edge length, or turning angle.
+
+5. The model is not E(2)-equivariant.
+   It still relies on preprocessing and learned invariances rather than built-in geometric symmetry handling.
+
+## `DenoiseGCN`
+
+Relevant code:
+
+- Wrapper and graph assembly: [`diffusion.py`](diffusion.py) lines 172-257
+- Base graph convolution: [`gcn.py`](gcn.py) lines 8-34
+
+### Intuition
+
+This is the simpler graph baseline. Instead of learning attention weights, each node just averages information from a fixed 3-node neighborhood:
+
+- itself
+- previous neighbor
+- next neighbor
+
+Then a small MLP turns the final hidden state into the predicted 2D noise.
+
+This makes the GCN easier to reason about, but also much more prone to oversmoothing.
+
+### Exact features given to each node
+
+Each node gets:
+
+```text
+h_k^(0) = [x_k, y_k, phi(t)]
+```
+
+So the GCN currently sees:
+
+1. noisy `x`
+2. noisy `y`
+3. timestep embedding `phi(t)`
+
+It does not currently see:
+
+- cycle positional features
+- pooled global graph features
+- edge features
+- long-range edges
+
+Relevant code:
+
+- timestep MLP: [`diffusion.py`](diffusion.py) lines 184-188
+- node feature concatenation: [`diffusion.py`](diffusion.py) lines 245-249
+
+### Graph math
+
+The adjacency matrix encodes:
+
+```text
+A_{k,k} = A_{k,k+1} = A_{k,k-1} = 1/3
+```
+
+for each vertex `k`.
+
+The base graph convolution in [`gcn.py`](gcn.py) does:
+
+```text
+support = H W
+output = A support
+```
+
+or equivalently:
+
+```text
+tilde_H = A H W
+```
+
+The wrapper then adds a residual path and nonlinearity:
+
+```text
+H^{(l+1)} = SiLU(A H^(l) W_l + R_l(H^(l)))
+```
+
+where `R_l` is:
+
+- identity if widths match
+- linear projection otherwise
+
+Finally a per-node MLP predicts the 2D noise:
+
+```text
+eps_hat_k = MLP(h_k^(L))
+```
+
+Relevant code:
+
+- adjacency indices and values: [`diffusion.py`](diffusion.py) lines 206-237
+- residual graph stack: [`diffusion.py`](diffusion.py) lines 251-254
+- node head: [`diffusion.py`](diffusion.py) lines 201-205 and 256-257
+- base `GraphConvolution`: [`gcn.py`](gcn.py) lines 28-34
+
+### Current concerns
+
+1. Oversmoothing is built into the operator.
+   Every layer mixes each node with a fixed local average.
+
+2. Residuals help optimization, but not expressivity enough.
+   They keep information alive, but the core message passing is still low-pass.
+
+3. No positional features and no global context.
+   That leaves the model weak on symmetry breaking and whole-polygon coordination.
+
+4. Empirically it has been the least promising denoiser so far.
+   This matches the theory: fixed averaging is a poor fit for detailed noise prediction.
+
+## `build_denoiser(...)`
+
+Relevant code:
+
+- [`diffusion.py`](diffusion.py) lines 260-288
+
+### Intuition
+
+This is the switchboard that keeps the rest of the training and sampling code architecture-agnostic.
+
+### Behavior
+
+It reads:
+
+- `model.type`
+- `hidden_dim`
+- `time_emb_dim`
+- `num_layers`
+
+and returns one of:
+
+- `DenoiseMLP`
+- `DenoiseGAT`
+- `DenoiseGCN`
+
+If `model.type` is missing, it defaults to `gat`.
+
+## `DiffusionConfig`
+
+Relevant code:
+
+- [`diffusion.py`](diffusion.py) lines 292-296
+
+This stores:
+
+- `n_steps`
+- `beta_start`
+- `beta_end`
+
+Those determine the linear beta schedule used by the DDPM wrapper.
+
+## `Diffusion`
+
+Relevant code:
+
+- schedule setup: [`diffusion.py`](diffusion.py) lines 299-339
+- forward noising: [`diffusion.py`](diffusion.py) lines 347-353
+- reverse step: [`diffusion.py`](diffusion.py) lines 358-379
+- full sampling loop: [`diffusion.py`](diffusion.py) lines 381-425
+- training loss: [`diffusion.py`](diffusion.py) lines 427-455
+
+### Intuition
+
+The `Diffusion` class is the outer algorithm around the denoiser:
+
+- it decides how much noise to add during training
+- it turns the denoiser output into a reverse diffusion step at sampling time
+- it computes training statistics for debugging
+
+The denoiser predicts `eps`, but the `Diffusion` wrapper is what makes that prediction useful for DDPM training and ancestral sampling.
+
+### Forward process
+
+The forward process adds noise in closed form:
+
+```text
+x_t = sqrt(bar_alpha_t) * x_0 + sqrt(1 - bar_alpha_t) * eps
+```
+
+This is implemented in `q_sample(...)`.
+
+### Reverse process
+
+The model predicts `eps_theta(x_t, t)`, and DDPM converts that into the reverse mean:
+
+```text
+mu_theta(x_t, t) = (1 / sqrt(alpha_t)) * (x_t - (beta_t / sqrt(1 - bar_alpha_t)) * eps_theta(x_t, t))
+```
+
+Then for `t > 0`:
+
+```text
+x_{t-1} = mu_theta(x_t, t) + sqrt(tilde_beta_t) * z
+```
+
+For `t = 0`, the code returns the mean directly.
+
+### Training loss
+
+Training samples a random timestep and random Gaussian noise, constructs `x_t`, and minimizes:
+
+```text
+L_simple = E[ || eps - eps_theta(x_t, t) ||^2 ]
+```
+
+The code also logs:
+
+- `t_mean`, `t_std`
+- `x_t_std`
+- `noise_std`
+- `eps_pred_std`
+- `x0_pred_mse`
+
+Those are useful for diagnosing collapse, under-dispersion, or weak denoising.
+
+## Current Architecture Summary
+
+If you want the shortest possible summary:
+
+- `MLP`: sees the whole polygon at once, but has no graph structure.
+- `GAT`: best current graph denoiser, uses coordinates + cycle harmonics + time embedding + gated pooled global feature.
+- `GCN`: simpler graph baseline, but fixed neighborhood averaging makes it prone to oversmoothing.
+
+## Likely Next Improvements
+
+The next upgrades that fit this codebase naturally are:
+
+1. Long-range edges
+   Intuition: let nodes talk directly to opposite or multi-hop vertices.
+   Concern: can overconstrain a tiny graph.
+
+2. Better global context
+   Intuition: use a global token or attention pooling instead of blunt mean pooling.
+   Concern: can still collapse diversity if the global path dominates.
+
+3. Edge features
+   Intuition: let messages depend on geometry, not just adjacency.
+   Concern: requires careful normalization and invariance choices.
+
+4. Equivariant geometry models
+   Intuition: build rotational / translational structure into the model.
+   Concern: more complex and needs clean integration with existing preprocessing.

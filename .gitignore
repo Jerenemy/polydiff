@@ -42,3 +42,5 @@ pretrained_models/*.pt
 testpkg/
 
 *.jsonl
+
+plots/
