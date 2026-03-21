@@ -7,7 +7,7 @@ model:
   checkpoint: "models/diffusion_final.pt"
 
 sampling:
-  num_samples: 1000 #64
+  num_samples: 10000 #64
   # Optional inference-time override (must be <= checkpoint diffusion.n_steps)
   # n_steps: 25
   out_path: "data/processed/samples.npz"

@@ -105,7 +105,8 @@ class DenoiseGAT(nn.Module):
             nn.Sigmoid(),
         )
         self.node_head = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
+            # nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, self.coord_dim),
         )
@@ -153,20 +154,79 @@ class DenoiseGAT(nn.Module):
         if t.ndim != 1 or t.shape[0] != x.shape[0]:
             raise ValueError(f"t must have shape ({x.shape[0]},), got {tuple(t.shape)}")
 
+
         batch_size = x.shape[0]
+        # shape: scalar int
+        # meaning: number of polygons in the batch
+        # call it B
+
         coords = x.reshape(batch_size, self.num_vertices, self.coord_dim)
+        # shape: (B, V, 2)
+        # meaning: turn each flattened polygon back into V vertices with 2 coordinates each
+        # so coords[b, i] is the (x, y) pair for vertex i of polygon b
+
         time_emb = self.time_mlp(t).unsqueeze(1).expand(-1, self.num_vertices, -1)
+        # self.time_mlp(t): (B, T)
+        # unsqueeze(1):     (B, 1, T)
+        # expand(...):      (B, V, T)
+        # meaning: compute one timestep embedding per polygon, then copy it to every vertex
+        # so all vertices in the same polygon get the same diffusion-time context
+
         pos_enc = self.vertex_positional_features.to(x.device).unsqueeze(0).expand(batch_size, -1, -1)
+        # self.vertex_positional_features: (V, P) = (V, 4)
+        # unsqueeze(0):                    (1, V, P)
+        # expand(...):                     (B, V, P)
+        # meaning: give each vertex a fixed "where am I on the ring?" encoding
+        # this is the sin/cos cycle-position info, copied across the batch
+
         node_features = torch.cat([coords, pos_enc, time_emb], dim=-1).reshape(batch_size * self.num_vertices, -1)
+        # before reshape:
+        #   coords:      (B, V, 2)
+        #   pos_enc:     (B, V, P)
+        #   time_emb:    (B, V, T)
+        # cat dim=-1 ->  (B, V, 2 + P + T)
+        #
+        # after reshape:
+        #   (B * V, 2 + P + T)
+        #
+        # meaning: each row is now one vertex from one polygon
+        # all batch polygons are flattened into one big list of nodes
+
         edge_index = self._batched_edge_index(batch_size, x.device)
+        # shape: (2, E_total)
+        # meaning: graph connectivity for the whole batch
+        # this is not one connected giant graph in the semantic sense
+        # it is a disjoint union of B separate cycle graphs, one per polygon
+
         node_hidden, _ = self.gat((node_features, edge_index))
+        # input node_features: (B * V, 2 + P + T)
+        # output node_hidden:  (B * V, H)
+        # meaning: GAT computes one hidden embedding per vertex
+        # each row now represents one vertex after message passing with neighbors
+
         node_hidden = node_hidden.reshape(batch_size, self.num_vertices, -1)
-        global_features = self.global_head(node_hidden.mean(dim=1))
-        global_features = global_features.unsqueeze(1).expand(-1, self.num_vertices, -1)
-        global_gate = self.global_gate(torch.cat([node_hidden, global_features], dim=-1))
-        gated_global = global_gate * global_features
-        node_noise = self.node_head(torch.cat([node_hidden, gated_global], dim=-1).reshape(batch_size * self.num_vertices, -1))
+        # shape: (B, V, H)
+        # meaning: restore the batch structure
+        # node_hidden[b, i] is the hidden vector for vertex i in polygon b
+
+        node_noise = self.node_head(node_hidden.reshape(batch_size * self.num_vertices, -1))
+        # node_hidden.reshape(...): (B * V, H)
+        # self.node_head output:    (B * V, 2)
+        # meaning: predict a 2D noise vector for each vertex independently from its hidden embedding
+        # so each row is the predicted (delta_x_noise, delta_y_noise) for one vertex
+
         return node_noise.reshape(batch_size, self.data_dim)
+        # node_noise before reshape: (B * V, 2)
+        # after reshape:             (B, 2 * V) = (B, data_dim)
+        # meaning: flatten per-vertex predictions back into the same format as the input/output diffusion tensors
+
+        ### global features: currently removed
+        # # global_features = self.global_head(node_hidden.mean(dim=1))
+        # # global_features = global_features.unsqueeze(1).expand(-1, self.num_vertices, -1)
+        # # global_gate = self.global_gate(torch.cat([node_hidden, global_features], dim=-1))
+        # # gated_global = global_gate * global_features
+        # # node_noise = self.node_head(torch.cat([node_hidden, gated_global], dim=-1).reshape(batch_size * self.num_vertices, -1))
+
 
 
 class DenoiseGCN(nn.Module):

@@ -281,50 +281,41 @@ Relevant code:
 
 - head count and hidden sizing: [`diffusion.py`](diffusion.py) lines 84-98
 
-### Gated pooled global feature
+### Global feature path status
 
-After message passing, the model adds a graph-level summary:
+The constructor still defines a pooled global feature path:
 
-```text
-g = psi(mean_k h_k^(L))
-```
-
-where `psi` is `global_head`.
-
-Then each node decides how much of that summary to use:
-
-```text
-gamma_k = sigmoid(W_g [h_k^(L) ; g])
-g_k = gamma_k odot g
-```
-
-Finally:
-
-```text
-eps_hat_k = MLP([h_k^(L) ; g_k])
-```
-
-Intuition:
-
-- `mean_k h_k^(L)` asks: what is the average hidden state of this whole polygon?
-- `g` is a coarse whole-graph summary
-- `gamma_k` is a gate that stops every node from using the global summary equally
-- the final per-node MLP turns `[local hidden ; gated global]` into a 2D noise vector
+- `global_head`
+- `global_gate`
 
 Relevant code:
 
-- global head: [`diffusion.py`](diffusion.py) lines 99-102
-- global gate: [`diffusion.py`](diffusion.py) lines 103-106
-- node head: [`diffusion.py`](diffusion.py) lines 107-111
-- forward pass for pooled global feature and gate: [`diffusion.py`](diffusion.py) lines 162-169
+- [`diffusion.py`](diffusion.py) lines 99-106
+
+However, the current active `forward(...)` path does not use those tensors. The model currently predicts per-node noise directly from `node_hidden`:
+
+```text
+eps_hat_k = MLP(h_k^(L))
+```
+
+Relevant code:
+
+- active per-node readout: [`diffusion.py`](diffusion.py) lines 201-218
+- commented-out old global-feature block: [`diffusion.py`](diffusion.py) lines 223-228
+
+Intuition:
+
+- the graph modules for pooled global context still exist in the class
+- but the current experiment is effectively a pure node-level GAT readout
+- this matches the current `node_head`, which takes `hidden_dim` inputs rather than `2 * hidden_dim`
 
 ### Current concerns
 
 1. The graph is still very local.
    Even with several layers, global structure still has to emerge mostly through multi-hop local propagation.
 
-2. Mean-pooling is blunt.
-   It can suppress catastrophic outliers, but it can also shrink sample variance and pull generation toward average shapes.
+2. The previously tested mean-pooled global path was blunt.
+   It reduced some bad outliers, but it also tended to shrink variance and pull generation toward average shapes, which is why the current forward path bypasses it.
 
 3. There are no explicit long-range edges.
    Opposite or multi-hop relationships are not encoded directly.
@@ -440,6 +431,248 @@ Relevant code:
 
 4. Empirically it has been the least promising denoiser so far.
    This matches the theory: fixed averaging is a poor fit for detailed noise prediction.
+
+## Why GNNs Can Be Counterproductive For Regular Hexagon Denoising
+
+This section is about the current task specifically: denoising near-regular, fixed-size hexagons represented as ordered vertex coordinates.
+
+### Short answer
+
+For this task, the MLP has two major advantages:
+
+1. it sees the entire polygon immediately
+2. the polygon is tiny, fixed-size, and consistently ordered
+
+Those two facts remove much of the reason to use a graph network in the first place.
+
+### Why the MLP can be stronger on regular hexagons
+
+For a hexagon, the input is only 12 numbers:
+
+```text
+[x_1, y_1, x_2, y_2, ..., x_6, y_6]
+```
+
+The MLP denoiser gets the whole 12D vector at once, so it can learn direct global rules such as:
+
+- if the right side moves out, pull the opposite side into a matching place
+- if one top vertex shifts, adjust the adjacent and opposite vertices consistently
+- if the whole shape looks like a noisy hexagon, predict a coordinated 12D correction
+
+That is easy for an MLP because every output coordinate can depend on every input coordinate immediately.
+
+The GNN, by contrast, starts from per-node features and has to reconstruct those global relationships through message passing over a tiny cycle graph.
+
+For 6 vertices, that can be a bad trade:
+
+- the graph is too small for locality to be a strong advantage
+- the ring is very symmetric
+- many vertices look locally similar
+- the model has to infer whole-shape coordination from repeated local updates
+
+So in this regime, the graph inductive bias can be restrictive rather than helpful.
+
+### Concrete hexagon example: what one hidden node vector means
+
+Suppose vertex `k` is the upper-right corner of a noisy near-regular hexagon. Before message passing, its initial feature is:
+
+```text
+h_k^(0) = [x_k, y_k,
+           sin(2*pi*k/6), cos(2*pi*k/6),
+           sin(4*pi*k/6), cos(4*pi*k/6),
+           phi(t)]
+```
+
+This is still mostly raw input information:
+
+- where this vertex currently is
+- where it sits on the ring
+- what diffusion timestep the model is at
+
+After one GAT layer, the hidden vector is no longer just `(x, y)` with neighbors appended. It becomes a learned feature vector of width `hidden_dim`, for example 256 channels:
+
+```text
+h_k^(1) in R^256
+```
+
+That vector is produced by:
+
+1. projecting the current node features into a hidden space
+2. projecting neighbor features into the same hidden space
+3. attention-weighting the neighbors
+4. summing those weighted neighbor messages
+5. mixing that result with a skip connection from the current node
+
+Relevant code:
+
+- GAT projection and attention: [`gat.py`](gat.py) lines 82-120
+- skip connection and output mixing: [`gat.py`](gat.py) lines 235-259
+
+So the hidden vector is best thought of as a learned summary of things like:
+
+- estimated local radius
+- whether the left and right neighbors are symmetric
+- whether the local corner angle looks too sharp or too flat
+- whether this node is in the upper-right, lower-left, etc.
+- how much denoising should happen at this timestep
+
+These are not explicit named channels in the code. They are learned hidden coordinates. But that is the kind of information they can represent.
+
+### Are neighbor messages added to `x, y`, or are there more features?
+
+The answer is: there are more features.
+
+The GNN does not usually keep working in raw `x, y` space after the first step. Instead:
+
+- raw node features are projected into a hidden feature space
+- neighbor information is aggregated in that hidden space
+- the output hidden vector has width `hidden_dim`, not width 2
+
+So for the current GAT:
+
+```text
+h_k^(0) in R^(2 + 4 + time_emb_dim)
+h_k^(1), h_k^(2), ..., h_k^(L) in R^hidden_dim
+```
+
+The neighbors are not simply stuck onto the current `x, y`, and they are not just numerically added to `x, y` either. They are transformed, weighted, aggregated, and mixed into a new learned representation.
+
+For the current GCN, the same high-level idea holds, but the aggregation is simpler:
+
+```text
+H^{(l+1)} = SiLU(A H^(l) W_l + R_l(H^(l)))
+```
+
+so neighbor information is averaged through the adjacency matrix and then mapped into hidden channels.
+
+### Why this can still fail on the hexagon case
+
+A near-regular hexagon has extremely repetitive local structure:
+
+- every node has degree 2 on the cycle
+- every local corner is similar
+- every local edge pair is similar
+- opposite-side coordination matters, but that is not directly local
+
+So after message passing, many node embeddings can become too similar in the very regime where the model actually needs precise global coordination.
+
+That is one way to say the graph bias is counterproductive here:
+
+- it emphasizes local similarity
+- the task actually needs easy global coordination across all 6 vertices
+- the MLP gets that global coupling for free
+
+### A polygon generation task where a GNN would be the right tool
+
+A GNN becomes much more compelling when the polygon behaves like a sampled boundary curve rather than a tiny fixed-size object.
+
+Example:
+
+- polygons with 50 to 200 vertices
+- variable numbers of vertices across samples
+- smooth local deformations such as dents, bulges, bends, or locally sharp corners
+- optional edge features like segment length or relative displacement
+
+Examples of real tasks in that regime:
+
+- cell boundary generation
+- coastline-like contour generation
+- object silhouette denoising from many boundary samples
+- shape completion where local neighborhood geometry matters
+
+Why a GNN is better there:
+
+- local geometry is genuinely informative
+- message passing lets the same local denoising rule apply around the boundary
+- the model scales more naturally with larger `n`
+- it can handle richer edge/node attributes than a flat MLP baseline
+
+In short:
+
+- regular hexagons are small enough that the MLP's immediate global view is often better
+- large, locally structured contours are where a GNN starts to make much more sense
+
+### What if polygon size varied?
+
+If the task changed from "denoise fixed-size hexagons" to "denoise polygons with varying numbers of vertices and make them regular," then a GNN would usually become the better conceptual fit.
+
+Why:
+
+1. An MLP expects a fixed input width.
+   If `n` changes, then the flattened polygon width `2n` changes too, so a plain MLP cannot naturally use one shared architecture across all polygon sizes.
+
+2. A GNN naturally works at the node level.
+   The same message-passing rule can be applied to a polygon with 5, 20, or 100 vertices, as long as you can build the graph structure for each polygon.
+
+3. "Make this polygon locally and globally more regular" is a graph-shaped problem.
+   Each vertex should become consistent with its neighbors, while the whole cycle should become more uniform overall. That is exactly the kind of structure a graph model is meant to express.
+
+So if you wanted one model to handle many polygon sizes, the ranking would usually be:
+
+- conceptually: GNN is more appropriate
+- conceptually: plain MLP is less appropriate
+
+### Important implementation caveat
+
+That is the conceptual answer. The current codebase still assumes fixed `num_vertices` in the denoiser wrappers.
+
+Relevant code:
+
+- fixed `num_vertices` derived from `data_dim`: [`diffusion.py`](diffusion.py) lines 67-71 and 180-182
+- fixed cycle positional features buffer in GAT: [`diffusion.py`](diffusion.py) lines 78-82
+- fixed cycle edge construction from `self.num_vertices`: [`diffusion.py`](diffusion.py) lines 114-148 and 206-237
+
+So the current `DenoiseMLP`, `DenoiseGAT`, and `DenoiseGCN` are all built for one fixed polygon size per model instance.
+
+To truly support varying-size polygons in one model, you would likely need at least:
+
+- ragged or batched graph handling by sample
+- dynamic edge construction per polygon
+- positional features that depend on each polygon's own `n`
+- a loss and batching path that can handle variable-length polygons cleanly
+
+### Would an MLP still ever be reasonable?
+
+Only in a weaker sense.
+
+If you padded every polygon to a maximum size and used masks, you could still force an MLP to operate on variable-size data. But compared with a graph model, that would usually be:
+
+- less natural
+- less parameter-efficient
+- more brittle to changes in `n`
+- less likely to generalize cleanly across polygon sizes
+
+So for:
+
+- fixed `n = 6` regular hexagons: MLP can easily win
+- variable `n` regular polygons with one shared model: GNN is usually the better direction
+
+### Is a GNN relevant to classifier guidance?
+
+Not inherently.
+
+Classifier guidance is a sampling strategy, not a denoiser architecture choice. The core idea is:
+
+- train a classifier or conditional model on noisy inputs `x_t`
+- at sampling time, use the gradient of that model with respect to `x_t`
+- bias the reverse diffusion trajectory toward the desired condition
+
+That mechanism does not require a GNN. You could do classifier guidance with:
+
+- an MLP classifier
+- a CNN
+- a Transformer
+- a GNN
+
+The GNN only matters if the classifier itself would benefit from graph structure.
+
+So for your polygon setup:
+
+- classifier guidance is compatible with a GNN denoiser
+- classifier guidance is also compatible with an MLP denoiser
+- using guidance does not by itself make a GNN more necessary
+
+The architectural question and the guidance question are mostly orthogonal.
 
 ## `build_denoiser(...)`
 
