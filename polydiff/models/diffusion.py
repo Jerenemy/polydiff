@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 import torch
 import torch.nn as nn
@@ -57,7 +57,14 @@ class DenoiseMLP(nn.Module):
         return self.net(h)                                  # predict eps_hat: (B, data_dim)
 
 class DenoiseGAT(nn.Module):
-    def __init__(self, data_dim: int, hidden_dim: int, time_emb_dim: int, num_layers: int) -> None:
+    def __init__(
+        self,
+        data_dim: int,
+        hidden_dim: int,
+        time_emb_dim: int,
+        num_layers: int,
+        use_global_features: bool = False,
+    ) -> None:
         super().__init__()
         if data_dim % 2 != 0:
             raise ValueError(f"data_dim must be even for flattened 2D polygon coordinates, got {data_dim}")
@@ -69,6 +76,7 @@ class DenoiseGAT(nn.Module):
         self.num_vertices = data_dim // self.coord_dim
         self.time_emb_dim = time_emb_dim
         self.pos_enc_dim = 4
+        self.use_global_features = bool(use_global_features)
 
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(time_emb_dim),
@@ -96,17 +104,22 @@ class DenoiseGAT(nn.Module):
             num_features_per_layer=num_features_per_layer,
             dropout=0.0,
         )
-        self.global_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-        )
-        self.global_gate = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.Sigmoid(),
-        )
+        if self.use_global_features:
+            self.global_head = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.SiLU(),
+            )
+            self.global_gate = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.Sigmoid(),
+            )
+            node_head_in_dim = hidden_dim * 2
+        else:
+            self.global_head = None
+            self.global_gate = None
+            node_head_in_dim = hidden_dim
         self.node_head = nn.Sequential(
-            # nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(node_head_in_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, self.coord_dim),
         )
@@ -209,7 +222,15 @@ class DenoiseGAT(nn.Module):
         # meaning: restore the batch structure
         # node_hidden[b, i] is the hidden vector for vertex i in polygon b
 
-        node_noise = self.node_head(node_hidden.reshape(batch_size * self.num_vertices, -1))
+        if self.use_global_features:
+            global_features = self.global_head(node_hidden.mean(dim=1))
+            global_features = global_features.unsqueeze(1).expand(-1, self.num_vertices, -1)
+            global_gate = self.global_gate(torch.cat([node_hidden, global_features], dim=-1))
+            node_readout = torch.cat([node_hidden, global_gate * global_features], dim=-1)
+        else:
+            node_readout = node_hidden
+
+        node_noise = self.node_head(node_readout.reshape(batch_size * self.num_vertices, -1))
         # node_hidden.reshape(...): (B * V, H)
         # self.node_head output:    (B * V, 2)
         # meaning: predict a 2D noise vector for each vertex independently from its hidden embedding
@@ -219,18 +240,15 @@ class DenoiseGAT(nn.Module):
         # node_noise before reshape: (B * V, 2)
         # after reshape:             (B, 2 * V) = (B, data_dim)
         # meaning: flatten per-vertex predictions back into the same format as the input/output diffusion tensors
-
-        ### global features: currently removed
-        # # global_features = self.global_head(node_hidden.mean(dim=1))
-        # # global_features = global_features.unsqueeze(1).expand(-1, self.num_vertices, -1)
-        # # global_gate = self.global_gate(torch.cat([node_hidden, global_features], dim=-1))
-        # # gated_global = global_gate * global_features
-        # # node_noise = self.node_head(torch.cat([node_hidden, gated_global], dim=-1).reshape(batch_size * self.num_vertices, -1))
-
-
-
 class DenoiseGCN(nn.Module):
-    def __init__(self, data_dim: int, hidden_dim: int, time_emb_dim: int, num_layers: int) -> None:
+    def __init__(
+        self,
+        data_dim: int,
+        hidden_dim: int,
+        time_emb_dim: int,
+        num_layers: int,
+        use_global_features: bool = False,
+    ) -> None:
         super().__init__()
         if data_dim % 2 != 0:
             raise ValueError(f"data_dim must be even for flattened 2D polygon coordinates, got {data_dim}")
@@ -240,6 +258,7 @@ class DenoiseGCN(nn.Module):
         self.data_dim = data_dim
         self.coord_dim = 2
         self.num_vertices = data_dim // self.coord_dim
+        self.use_global_features = bool(use_global_features)
 
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(time_emb_dim),
@@ -258,8 +277,22 @@ class DenoiseGCN(nn.Module):
             for i in range(len(dims) - 1)
         )
         self.activation = nn.SiLU()
+        if self.use_global_features:
+            self.global_head = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.SiLU(),
+            )
+            self.global_gate = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.Sigmoid(),
+            )
+            node_head_in_dim = hidden_dim * 2
+        else:
+            self.global_head = None
+            self.global_gate = None
+            node_head_in_dim = hidden_dim
         self.node_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(node_head_in_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, self.coord_dim),
         )
@@ -313,8 +346,17 @@ class DenoiseGCN(nn.Module):
             h = layer(h, adj) + residual
             h = self.activation(h)
 
-        h = self.node_head(h)
-        return h.reshape(batch_size, self.data_dim)
+        node_hidden = h.reshape(batch_size, self.num_vertices, -1)
+        if self.use_global_features:
+            global_features = self.global_head(node_hidden.mean(dim=1))
+            global_features = global_features.unsqueeze(1).expand(-1, self.num_vertices, -1)
+            global_gate = self.global_gate(torch.cat([node_hidden, global_features], dim=-1))
+            node_readout = torch.cat([node_hidden, global_gate * global_features], dim=-1)
+        else:
+            node_readout = node_hidden
+
+        node_noise = self.node_head(node_readout.reshape(batch_size * self.num_vertices, -1))
+        return node_noise.reshape(batch_size, self.data_dim)
 
 
 def build_denoiser(*, data_dim: int, model_cfg: Mapping[str, Any] | None = None) -> nn.Module:
@@ -323,6 +365,7 @@ def build_denoiser(*, data_dim: int, model_cfg: Mapping[str, Any] | None = None)
     hidden_dim = int(cfg.get("hidden_dim", 256))
     time_emb_dim = int(cfg.get("time_emb_dim", 64))
     num_layers = int(cfg.get("num_layers", 3))
+    use_global_features = bool(cfg.get("use_global_features", False))
 
     if model_type == "mlp":
         return DenoiseMLP(
@@ -337,6 +380,7 @@ def build_denoiser(*, data_dim: int, model_cfg: Mapping[str, Any] | None = None)
             hidden_dim=hidden_dim,
             time_emb_dim=time_emb_dim,
             num_layers=num_layers,
+            use_global_features=use_global_features,
         )
     if model_type == "gcn":
         return DenoiseGCN(
@@ -344,6 +388,7 @@ def build_denoiser(*, data_dim: int, model_cfg: Mapping[str, Any] | None = None)
             hidden_dim=hidden_dim,
             time_emb_dim=time_emb_dim,
             num_layers=num_layers,
+            use_global_features=use_global_features,
         )
     raise ValueError(f"Unsupported model.type {model_type!r}; expected one of: mlp, gat, gcn")
 
@@ -354,6 +399,9 @@ class DiffusionConfig:
     n_steps: int = 1000
     beta_start: float = 1e-4
     beta_end: float = 2e-2
+
+
+GuidanceGradFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 
 class Diffusion:
@@ -415,11 +463,18 @@ class Diffusion:
     def predict_eps(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         return self.model(x_t, t) # eps_hat = model(x_t, t)
 
-    def p_sample(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def p_sample(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        *,
+        guidance_grad: GuidanceGradFn | None = None,
+    ) -> torch.Tensor:
         """Reverse diffusion step: sample x_{t-1} from learned p(x_{t-1} | x_t)."""
         betas_t = self.betas[t].unsqueeze(1)                        # gather β_t per sample, shape (B,1)
         sqrt_recip_alpha_t = self.sqrt_recip_alphas[t].unsqueeze(1) # gather sqrt(1/α_t) per sample, shape (B,1)
         sqrt_omab_t = self.sqrt_one_minus_alphas_cumprod[t].unsqueeze(1) # gather sqrt(1-ᾱ_t), shape (B,1)
+        posterior_var_t = self.posterior_variance[t].unsqueeze(1)   # gather β̃_t per sample, shape (B,1)
 
         eps_pred = self.predict_eps(x_t, t)                         # model predicts ε_hat(x_t, t)
         
@@ -427,11 +482,19 @@ class Diffusion:
         # μθ(x_t,t) = (1/sqrt(α_t)) * (x_t - (β_t / sqrt(1-ᾱ_t)) * ε_hat)
         model_mean = sqrt_recip_alpha_t * (x_t - betas_t * eps_pred / sqrt_omab_t)
 
+        if guidance_grad is not None:
+            grad = guidance_grad(x_t, t)
+            if grad.shape != x_t.shape:
+                raise ValueError(
+                    f"guidance_grad must return shape {tuple(x_t.shape)}, got {tuple(grad.shape)}"
+                )
+            # Classifier guidance shifts the reverse mean in x-space using ∇_x log p(y | x_t).
+            model_mean = model_mean + posterior_var_t * grad
+
         # At t=0, return the mean (no noise added in the final step)
         if t.min().item() == 0:
             return model_mean
 
-        posterior_var_t = self.posterior_variance[t].unsqueeze(1)   # gather β̃_t per sample, shape (B,1)
         noise = torch.randn_like(x_t)        
         
         # Sample:
@@ -444,6 +507,7 @@ class Diffusion:
         *,
         steps: int,
         trajectory_index: Optional[int] = None,
+        guidance_grad: GuidanceGradFn | None = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         if trajectory_index is not None and not 0 <= trajectory_index < shape[0]:
             raise ValueError(f"trajectory_index must be in [0, {shape[0] - 1}], got {trajectory_index}")
@@ -456,7 +520,7 @@ class Diffusion:
                 trajectory = [x[trajectory_index].detach().cpu().clone()]
             for step in reversed(range(steps)):             # iterate t = steps-1, ..., 0
                 t = torch.full((shape[0],), step, device=self.device, dtype=torch.long) # batch of identical t
-                x = self.p_sample(x, t)                     # sample x_{t-1} from x_t
+                x = self.p_sample(x, t, guidance_grad=guidance_grad) # sample x_{t-1} from x_t
                 if trajectory is not None:
                     trajectory.append(x[trajectory_index].detach().cpu().clone())
 
@@ -464,10 +528,16 @@ class Diffusion:
             return x, None
         return x, torch.stack(trajectory, dim=0)
 
-    def p_sample_loop(self, shape: tuple[int, int], n_steps: Optional[int] = None) -> torch.Tensor:
+    def p_sample_loop(
+        self,
+        shape: tuple[int, int],
+        n_steps: Optional[int] = None,
+        *,
+        guidance_grad: GuidanceGradFn | None = None,
+    ) -> torch.Tensor:
         """Generate samples starting from pure noise x_T ~ N(0,I)."""
         steps = self._resolve_n_steps(n_steps)
-        x, _ = self._sample_loop(shape, steps=steps)
+        x, _ = self._sample_loop(shape, steps=steps, guidance_grad=guidance_grad)
         return x                                            # final x is a generated sample (approx x_0)
 
     def p_sample_loop_trajectory(
@@ -476,10 +546,16 @@ class Diffusion:
         *,
         n_steps: Optional[int] = None,
         trajectory_index: int = 0,
+        guidance_grad: GuidanceGradFn | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Generate samples and record one sample's denoising trajectory."""
         steps = self._resolve_n_steps(n_steps)
-        x, trajectory = self._sample_loop(shape, steps=steps, trajectory_index=trajectory_index)
+        x, trajectory = self._sample_loop(
+            shape,
+            steps=steps,
+            trajectory_index=trajectory_index,
+            guidance_grad=guidance_grad,
+        )
         if trajectory is None:
             raise RuntimeError("trajectory capture unexpectedly returned no trajectory")
         return x, trajectory

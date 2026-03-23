@@ -10,7 +10,21 @@ sampling:
   num_samples: 10000 #64
   # Optional inference-time override (must be <= checkpoint diffusion.n_steps)
   # n_steps: 25
-  out_path: "data/processed/samples.npz"
+  out_path: "data/processed/sample_reg.npz"
+  # Optional classifier, regressor, analytic regularity, or analytic area guidance.
+  # The sampler itself is architecture-agnostic:
+  # it only consumes a gradient in x-space, so a future variable-size GNN
+  # guidance model can plug into the same interface.
+  guidance:
+    enabled: true
+    kind: regularity   # classifier | regressor | regularity | area
+  #   checkpoint: "models/classifier_final.pt"  # required for classifier/regressor only
+    scale: 100.0
+  #   target_class: 1    # classifier only
+  #   target_value: 0.95 # regressor, regularity, or area only; omit to maximize the objective
+  #   alpha: 8.0         # regularity only
+  #   beta: 5.0          # regularity only
+  #   gamma: 4.0         # regularity only
   # Optional GIF export of one sample's reverse diffusion trajectory.
   # animation:
   #   out_path: "data/processed/sample_trajectory.gif"

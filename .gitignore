@@ -33,6 +33,7 @@ pip-wheel-metadata/
 
 # Local training artifacts
 models/*.pt
+models/**/*.pt
 pretrained_models/*.pt
 
 # Logs

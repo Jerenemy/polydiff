@@ -1,0 +1,33 @@
+# Guidance-model training config for classifier or regressor guidance experiments
+experiment_name: "polydiff-guidance-train"
+seed: 0
+device: auto
+
+data:
+  path: "data/raw/hexagons.npz"
+  batch_size: 128
+  shuffle: true
+  num_workers: 0
+
+classifier:
+  type: mlp # future extension point: gat | gcn for variable-size polygon guidance
+  hidden_dim: 256
+  time_emb_dim: 64
+  num_layers: 3
+
+diffusion:
+  n_steps: 20
+  beta_start: 0.0001
+  beta_end: 0.02
+
+labels:
+  type: score_regression # score_threshold | score_regression
+  # threshold: 0.80
+
+training:
+  epochs: 30
+  lr: 0.0002
+  log_every: 50
+  save_every: 500
+  save_dir: "models"
+  checkpoint_name: "regressor_final.pt" # use regressor_final.pt for score_regression

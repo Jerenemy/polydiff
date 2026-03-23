@@ -39,12 +39,26 @@ class DiagnosticsOptions:
 
 
 @dataclass(frozen=True, slots=True)
+class GuidanceOptions:
+    enabled: bool
+    kind: str | None
+    checkpoint_path: Path | None
+    scale: float
+    target_class: int
+    target_value: float | None
+    alpha: float
+    beta: float
+    gamma: float
+
+
+@dataclass(frozen=True, slots=True)
 class SamplingRequest:
     num_samples: int
     n_steps: int
     out_path: Path
     animation: AnimationOptions | None
     diagnostics: DiagnosticsOptions
+    guidance: GuidanceOptions
 
 
 def load_diffusion_from_checkpoint(
@@ -147,6 +161,61 @@ def resolve_diagnostics_options(sampling_cfg: dict[str, Any]) -> DiagnosticsOpti
     )
 
 
+def resolve_guidance_options(sampling_cfg: dict[str, Any]) -> GuidanceOptions:
+    guidance_cfg = sampling_cfg.get("guidance", {})
+    if guidance_cfg is None:
+        guidance_cfg = {}
+    if not isinstance(guidance_cfg, dict):
+        raise ValueError("sampling.guidance must be a mapping if provided")
+
+    enabled = bool(guidance_cfg.get("enabled", False))
+    kind = guidance_cfg.get("kind")
+    checkpoint_path = guidance_cfg.get("checkpoint")
+    scale = float(guidance_cfg.get("scale", 1.0))
+    target_class = int(guidance_cfg.get("target_class", 1))
+    target_value_raw = guidance_cfg.get("target_value")
+    target_value = None if target_value_raw is None else float(target_value_raw)
+    alpha = float(guidance_cfg.get("alpha", 8.0))
+    beta = float(guidance_cfg.get("beta", 5.0))
+    gamma = float(guidance_cfg.get("gamma", 4.0))
+
+    if not enabled:
+        return GuidanceOptions(
+            enabled=False,
+            kind=None if kind is None else str(kind),
+            checkpoint_path=None if checkpoint_path is None else resolve_project_path(checkpoint_path),
+            scale=scale,
+            target_class=target_class,
+            target_value=target_value,
+            alpha=alpha,
+            beta=beta,
+            gamma=gamma,
+        )
+
+    kind_str = "classifier" if kind is None else str(kind).lower()
+    if kind_str not in {"classifier", "regressor", "regularity", "area"}:
+        raise ValueError(
+            f"Unsupported sampling.guidance.kind {kind!r}; expected 'classifier', 'regressor', 'regularity', or 'area'. "
+            "Future graph-based guidance models can reuse this interface."
+        )
+    if checkpoint_path is None and kind_str not in {"regularity", "area"}:
+        raise ValueError("sampling.guidance.checkpoint is required when guidance is enabled")
+    if scale < 0.0:
+        raise ValueError(f"sampling.guidance.scale must be >= 0, got {scale}")
+
+    return GuidanceOptions(
+        enabled=True,
+        kind=kind_str,
+        checkpoint_path=None if checkpoint_path is None else resolve_project_path(checkpoint_path),
+        scale=scale,
+        target_class=target_class,
+        target_value=target_value,
+        alpha=alpha,
+        beta=beta,
+        gamma=gamma,
+    )
+
+
 def resolve_sampling_request(
     sampling_cfg: dict[str, Any],
     *,
@@ -192,6 +261,7 @@ def resolve_sampling_request(
         out_path=out_path,
         animation=animation,
         diagnostics=resolve_diagnostics_options(sampling_cfg),
+        guidance=resolve_guidance_options(sampling_cfg),
     )
 
 

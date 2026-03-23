@@ -10,6 +10,7 @@ import numpy as np
 
 from .. import paths
 from ..utils.runtime import device_from_config, load_yaml_config, resolve_project_path, set_seed
+from .guidance import load_sampling_guidance
 from .runtime import (
     load_diffusion_from_checkpoint,
     resolve_sampling_request,
@@ -34,10 +35,11 @@ def sample_from_config(config_path: Path, *, cli_overrides: SampleCliOverrides |
     seed = int(cfg.get("seed", 0))
     set_seed(seed)
 
+    device = device_from_config(cfg)
     checkpoint_path = resolve_project_path(cfg.get("model", {}).get("checkpoint", "models/diffusion_final.pt"))
     checkpoint, diffusion, diffusion_config, n_vertices = load_diffusion_from_checkpoint(
         checkpoint_path,
-        device=device_from_config(cfg),
+        device=device,
     )
 
     sampling_cfg = cfg.get("sampling", {})
@@ -52,14 +54,61 @@ def sample_from_config(config_path: Path, *, cli_overrides: SampleCliOverrides |
     )
     request.out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    guidance_grad = None
+    if request.guidance.enabled:
+        _, guidance, guidance_n_vertices = load_sampling_guidance(
+            request.guidance.checkpoint_path,
+            device=device,
+            kind=request.guidance.kind or "classifier",
+            scale=request.guidance.scale,
+            n_vertices=n_vertices,
+            target_class=request.guidance.target_class,
+            target_value=request.guidance.target_value,
+            alpha=request.guidance.alpha,
+            beta=request.guidance.beta,
+            gamma=request.guidance.gamma,
+        )
+        if guidance_n_vertices != n_vertices:
+            raise ValueError(
+                f"guidance model n_vertices={guidance_n_vertices} does not match "
+                f"diffusion checkpoint n_vertices={n_vertices}"
+            )
+        guidance_grad = guidance
+        guidance_desc = f"scale={request.guidance.scale}"
+        if request.guidance.kind == "regularity":
+            guidance_desc += (
+                f", analytic_score(alpha={request.guidance.alpha}, "
+                f"beta={request.guidance.beta}, gamma={request.guidance.gamma})"
+            )
+        elif request.guidance.kind == "area":
+            guidance_desc += ", analytic_area(smooth_absolute_shoelace)"
+        else:
+            guidance_desc += f", checkpoint={request.guidance.checkpoint_path}"
+        if request.guidance.kind == "classifier":
+            guidance_desc += f", target_class={request.guidance.target_class}"
+        elif request.guidance.target_value is not None:
+            guidance_desc += f", target_value={request.guidance.target_value}"
+        elif request.guidance.kind == "regularity":
+            guidance_desc += ", objective=maximize_regularity_score"
+        elif request.guidance.kind == "area":
+            guidance_desc += ", objective=maximize_area"
+        else:
+            guidance_desc += ", objective=maximize_predicted_score"
+        print(f"[sample] enabled {request.guidance.kind} guidance ({guidance_desc})")
+
     if request.animation is None:
-        samples = diffusion.p_sample_loop((request.num_samples, n_vertices * 2), n_steps=request.n_steps)
+        samples = diffusion.p_sample_loop(
+            (request.num_samples, n_vertices * 2),
+            n_steps=request.n_steps,
+            guidance_grad=guidance_grad,
+        )
         trajectory = None
     else:
         samples, trajectory = diffusion.p_sample_loop_trajectory(
             (request.num_samples, n_vertices * 2),
             n_steps=request.n_steps,
             trajectory_index=request.animation.sample_index,
+            guidance_grad=guidance_grad,
         )
 
     samples = samples.detach().cpu().numpy().reshape(request.num_samples, n_vertices, 2).astype(np.float32)

@@ -158,6 +158,265 @@ Relevant files:
 - [`configs/sample_diffusion.yaml`](configs/sample_diffusion.yaml) lines 6-13 define checkpoint loading and sampling options.
 - [`polydiff/sampling/runtime.py`](polydiff/sampling/runtime.py) lines 50-70 rebuild the denoiser from the checkpoint's stored `model_cfg`.
 
+## Guidance
+
+The repo now supports optional sampling-time guidance. The denoiser still predicts noise as usual, but during reverse diffusion the sampler can add an extra gradient in `x`-space from a separate guidance model.
+
+Intuition:
+
+- the diffusion model says how to denoise
+- the guidance model says which direction in polygon-space looks more desirable
+- sampling combines both signals
+
+The guidance hook lives inside the reverse DDPM step. In [`polydiff/models/diffusion.py`](polydiff/models/diffusion.py) lines 421-457, `p_sample(...)` computes the usual reverse mean and then, if a guidance callback is present, shifts that mean by:
+
+```text
+model_mean <- model_mean + posterior_variance_t * guidance_grad(x_t, t)
+```
+
+That keeps the sampler generic: it only needs a gradient with respect to `x_t`, not a specific guidance architecture.
+
+### Guidance Model Types
+
+The current code supports four guidance modes:
+
+- `classifier`
+- `regressor`
+- `regularity`
+- `area`
+
+The first two are time-conditioned MLPs over the flattened noisy polygon. They live in [`polydiff/models/guidance_models.py`](polydiff/models/guidance_models.py).
+The last two are analytic, differentiable PyTorch objectives in [`polydiff/models/regularity_torch.py`](polydiff/models/regularity_torch.py).
+
+Shared idea:
+
+- input: noisy polygon `x_t`
+- input: timestep `t`
+- output: either class logits, a scalar score prediction, or a directly evaluated analytic geometry objective
+
+Current limitation:
+
+- the learned guidance models are currently MLPs only
+- the sampler interface is already generic enough that a future GNN guidance model can plug in later without changing the diffusion loop
+- the analytic regularity path is differentiable, but it still omits the discrete self-intersection test because that part of the original NumPy score is not autograd-friendly
+- the analytic area path can easily encourage scale blow-up, because increasing polygon area is often easiest by just making the sample larger
+
+### Classifier Guidance
+
+Classifier guidance trains a model to predict a class from noisy polygons.
+
+The current training path uses a threshold on the stored regularity score:
+
+- class `1`: score above threshold
+- class `0`: score below threshold
+
+This is configured in [`configs/train_guidance_model.yaml`](configs/train_guidance_model.yaml) lines 23-25 with:
+
+```yaml
+labels:
+  type: score_threshold
+  threshold: 0.80
+```
+
+At sampling time, classifier guidance computes:
+
+```text
+guidance_grad(x_t, t) = scale * ∇_x log p_phi(y = target_class | x_t, t)
+```
+
+Relevant code:
+
+- classifier-guidance gradient: [`polydiff/sampling/guidance.py`](polydiff/sampling/guidance.py)
+- guidance checkpoint loading: [`polydiff/sampling/guidance.py`](polydiff/sampling/guidance.py)
+
+Use this when you want a coarse target like:
+
+- "make the polygon more regular than this threshold"
+- "bias toward high-quality samples"
+
+### Regressor Guidance
+
+Regressor guidance trains a model to predict a continuous scalar, currently the polygon regularity score.
+
+This is configured in [`configs/train_guidance_model.yaml`](configs/train_guidance_model.yaml) lines 23-25 with:
+
+```yaml
+labels:
+  type: score_regression
+```
+
+At sampling time there are two modes:
+
+1. If `target_value` is omitted:
+
+```text
+guidance_grad(x_t, t) = scale * ∇_x f_phi(x_t, t)
+```
+
+This simply pushes samples toward higher predicted score.
+
+2. If `target_value` is provided:
+
+```text
+guidance_grad(x_t, t) = scale * ∇_x ( - (f_phi(x_t, t) - target_value)^2 )
+```
+
+This pushes samples toward a specific target score rather than just "higher is better."
+
+Relevant code:
+
+- regressor-guidance gradient: [`polydiff/sampling/guidance.py`](polydiff/sampling/guidance.py)
+- regressor checkpoint loading: [`polydiff/sampling/guidance.py`](polydiff/sampling/guidance.py)
+
+Use this when you want:
+
+- continuous control over regularity
+- the option to target a specific score rather than a thresholded class
+
+### Analytic Regularity Guidance
+
+Regularity guidance does not use a learned guidance network at all. Instead, it evaluates the polygon regularity score directly in PyTorch and backpropagates through that score with respect to `x_t`.
+
+This uses the same smooth score shape as the current NumPy regularity function:
+
+```text
+score(x) = exp(-alpha * edge_cv(x) - beta * angle_cv(x) - gamma * radius_cv(x))
+```
+
+At sampling time there are again two modes:
+
+1. If `target_value` is omitted:
+
+```text
+guidance_grad(x_t, t) = scale * ∇_x score(x_t)
+```
+
+2. If `target_value` is provided:
+
+```text
+guidance_grad(x_t, t) = scale * ∇_x ( - (score(x_t) - target_value)^2 )
+```
+
+This mode is useful when you want:
+
+- a guidance signal without training a separate network
+- a sanity-check baseline against learned regressor guidance
+- direct control over the exact analytic regularity objective
+
+Important caveat:
+
+- the differentiable Torch score intentionally leaves out the discrete self-intersection rejection logic from data generation, because that part is not differentiable
+
+Relevant code:
+
+- differentiable score: [`polydiff/models/regularity_torch.py`](polydiff/models/regularity_torch.py)
+- analytic guidance wrapper: [`polydiff/sampling/guidance.py`](polydiff/sampling/guidance.py)
+- sampling config example: [`configs/sample_diffusion.yaml`](configs/sample_diffusion.yaml)
+
+### Analytic Area Guidance
+
+Area guidance also skips the learned network. It computes polygon area directly with a differentiable Torch shoelace formula and backpropagates that objective with respect to `x_t`.
+
+By default it uses a smooth absolute area, so it still gives a usable gradient if the polygon orientation flips under noise:
+
+```text
+area(x) = sqrt(signed_area(x)^2 + eps)
+```
+
+At sampling time:
+
+1. If `target_value` is omitted:
+
+```text
+guidance_grad(x_t, t) = scale * ∇_x area(x_t)
+```
+
+2. If `target_value` is provided:
+
+```text
+guidance_grad(x_t, t) = scale * ∇_x ( - (area(x_t) - target_value)^2 )
+```
+
+Important caveat:
+
+- this objective does exactly what it says, which means it often rewards making the polygon larger rather than making it more regular
+
+Relevant code:
+
+- differentiable area: [`polydiff/models/regularity_torch.py`](polydiff/models/regularity_torch.py)
+- analytic guidance wrapper: [`polydiff/sampling/guidance.py`](polydiff/sampling/guidance.py)
+
+### Training A Guidance Model
+
+The guidance training entrypoint is `train_guidance_model.py`, and it supports both classifier and regressor guidance models.
+
+Run:
+
+```bash
+python -m polydiff.training.train_guidance_model --config configs/train_guidance_model.yaml
+```
+
+What it does:
+
+1. Loads polygons from the dataset
+2. Samples random diffusion timesteps
+3. Corrupts clean polygons into `x_t` using the same forward diffusion schedule as the denoiser
+4. Trains a time-conditioned guidance model on those noisy polygons
+
+So the guidance model learns to operate on the same noisy inputs it will see during guided sampling.
+
+Relevant code:
+
+- training entrypoint: [`polydiff/training/train_guidance_model.py`](polydiff/training/train_guidance_model.py) lines 34-238
+- task selection (`score_threshold` vs `score_regression`): [`polydiff/training/train_guidance_model.py`](polydiff/training/train_guidance_model.py) lines 53-68
+- noisy-input construction with `q_sample(...)`: [`polydiff/training/train_guidance_model.py`](polydiff/training/train_guidance_model.py) lines 139-148
+
+### Enabling Guidance During Sampling
+
+Sampling config now supports:
+
+```yaml
+sampling:
+  guidance:
+    enabled: true
+    kind: classifier   # classifier | regressor
+    checkpoint: "models/classifier_final.pt"
+    scale: 1.5
+    target_class: 1    # classifier only
+    # target_value: 0.95  # regressor only
+```
+
+Relevant code:
+
+- config parsing: [`polydiff/sampling/runtime.py`](polydiff/sampling/runtime.py) lines 161-204
+- request object wiring: [`polydiff/sampling/runtime.py`](polydiff/sampling/runtime.py) lines 207-253
+- sampling entrypoint loading the guidance checkpoint: [`polydiff/sampling/sample.py`](polydiff/sampling/sample.py) lines 57-80
+- example config block: [`configs/sample_diffusion.yaml`](configs/sample_diffusion.yaml) lines 14-23
+
+Practical guidance:
+
+- start with a small `scale`
+- verify the guided distribution against the unguided baseline
+- if you use regressor guidance, try both:
+  - maximizing the predicted score
+  - targeting a specific score with `target_value`
+
+### Why The Interface Was Structured This Way
+
+The sampler is deliberately decoupled from the guidance model architecture. It only consumes a gradient callback of the form:
+
+```text
+guidance_grad(x_t, t) -> tensor with shape x_t.shape
+```
+
+That means:
+
+- today's fixed-size MLP classifier works
+- today's fixed-size MLP regressor works
+- a future variable-size GNN guidance model can reuse the same sampler interface
+
+So the part that will likely change later is the guidance model builder, not the diffusion sampling loop.
+
 ## Diffusion Math
 
 All three denoisers plug into the same DDPM wrapper in [`polydiff/models/diffusion.py`](polydiff/models/diffusion.py).

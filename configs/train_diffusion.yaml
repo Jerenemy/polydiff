@@ -4,7 +4,7 @@ seed: 0
 device: auto
 
 data:
-  path: "data/raw/hexagons.npz"
+  path: "data/raw/hexagons_noisy.npz"
   batch_size: 128
   shuffle: true
   num_workers: 0
@@ -14,14 +14,15 @@ model:
   hidden_dim: 256
   time_emb_dim: 64
   num_layers: 3
+  use_global_features: false # gat | gcn only
 
 diffusion:
-  n_steps: 20
+  n_steps: 30
   beta_start: 0.0001
   beta_end: 0.02
 
 training:
-  epochs: 30
+  epochs: 40
   lr: 0.0002
   log_every: 50
   save_every: 500
