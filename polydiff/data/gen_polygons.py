@@ -56,6 +56,15 @@ def normalize_scale_rms(xy: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     return xy / s
 
 
+def normalize_pose_xy(xy: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    """Center a polygon, normalize RMS scale, and enforce CCW orientation."""
+    xy = np.asarray(xy, dtype=np.float64)
+    xy = xy - centroid_xy(xy)
+    xy = normalize_scale_rms(xy, eps=eps)
+    xy = enforce_ccw(xy)
+    return xy.astype(np.float32)
+
+
 def segments_intersect(a: np.ndarray, b: np.ndarray, c: np.ndarray, d: np.ndarray) -> bool:
     # Proper segment intersection test (excluding shared endpoints handled outside).
     def orient(p, q, r) -> float:
@@ -217,12 +226,8 @@ def make_polygon(
 
     xy = np.stack([r * np.cos(theta), r * np.sin(theta)], axis=1).astype(np.float64)
 
-    # Canonicalize: center, scale, CCW
-    xy = xy - centroid_xy(xy)
-    xy = normalize_scale_rms(xy)
-    xy = enforce_ccw(xy)
-
-    return xy.astype(np.float32)
+    # Canonicalize pose without removing the random global rotation.
+    return normalize_pose_xy(xy)
 
 
 def sample_polygon(

@@ -115,6 +115,7 @@ class SamplingRequest:
     num_samples: int
     n_steps: int
     out_path: Path
+    canonicalize_output: bool
     animation: AnimationOptions | None
     diagnostics: DiagnosticsOptions
     guidance: GuidanceOptions
@@ -528,10 +529,15 @@ def resolve_sampling_request(
     else:
         out_path = resolve_project_path(out_path_value)
     restoration = resolve_restoration_options(sampling_cfg)
+    canonicalize_output_cfg = sampling_cfg.get("canonicalize_output")
+    canonicalize_output = (restoration is None) if canonicalize_output_cfg is None else bool(canonicalize_output_cfg)
+    if restoration is not None and canonicalize_output:
+        raise ValueError("sampling.canonicalize_output must be false when restoration is enabled")
     return SamplingRequest(
         num_samples=num_samples,
         n_steps=n_steps,
         out_path=out_path,
+        canonicalize_output=canonicalize_output,
         animation=animation,
         diagnostics=resolve_diagnostics_options(sampling_cfg),
         guidance=resolve_guidance_options(
@@ -671,6 +677,7 @@ def write_sampling_diagnostics(
     options: DiagnosticsOptions,
     sampling_n_steps: int,
     sample_run_name: str | None = None,
+    output_pose_normalized: bool = False,
     restoration: RestorationProxyConfig | None = None,
     restoration_trajectory: dict[str, object] | None = None,
 ) -> Path | None:
@@ -725,6 +732,7 @@ def write_sampling_diagnostics(
         "samples_path": str(samples_out_path),
         "metrics_path": str(metrics_out_path),
         "sampling_n_steps": int(sampling_n_steps),
+        "output_pose_normalized": bool(output_pose_normalized),
         "generated_summary": generated_summary,
         "score_threshold_rates": score_thresholds,
         "reference_summary": reference_summary,
@@ -755,9 +763,18 @@ def write_sampling_diagnostics(
     else:
         print("[sample] no reference summary available for direct comparison")
     if distribution_distances is not None:
-        shift_value = distribution_distances.get("distribution_shift_mean_normalized_w1")
-        if shift_value is not None:
-            print(f"[sample] distribution shift: mean_normalized_w1={float(shift_value):.4f}")
+        shape_shift = distribution_distances.get("shape_distribution_shift_mean_normalized_w1")
+        pose_shift = distribution_distances.get("pose_distribution_shift_mean_normalized_w1")
+        overall_shift = distribution_distances.get("distribution_shift_mean_normalized_w1")
+        parts: list[str] = []
+        if shape_shift is not None:
+            parts.append(f"shape_mean_normalized_w1={float(shape_shift):.4f}")
+        if pose_shift is not None:
+            parts.append(f"pose_mean_normalized_w1={float(pose_shift):.4f}")
+        if overall_shift is not None:
+            parts.append(f"overall_mean_normalized_w1={float(overall_shift):.4f}")
+        if parts:
+            print(f"[sample] distribution shift: {', '.join(parts)}")
     restoration_summary = payload.get("restoration_summary")
     if isinstance(restoration_summary, dict):
         print(f"[sample] restoration summary: {format_restoration_summary(restoration_summary)}")

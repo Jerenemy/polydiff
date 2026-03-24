@@ -1,7 +1,9 @@
 import json
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 import yaml
 
@@ -12,9 +14,10 @@ from polydiff.data.diagnostics import (
     representative_polygon_indices,
     summarize_polygon_dataset,
 )
+from polydiff.data.polygon_dataset import load_polygon_dataset
 from polydiff.data.gen_polygons import batch
 from polydiff.models.diffusion import build_denoiser
-from polydiff.studies.run import run_study_from_config
+from polydiff.studies.run import _add_tradeoff_labels, refresh_study_outputs, run_study_from_config
 from polydiff.studies.runtime import apply_dotted_overrides, resolve_case_placeholders
 
 
@@ -29,6 +32,7 @@ def test_metric_tables_capture_distribution_shift():
     assert reference_table.shape[0] == 32
     assert observed_table.shape[0] == 32
     assert distances["score_normalized_w1"] > 0.0
+    assert distances["shape_distribution_shift_mean_normalized_w1"] > 0.0
     assert distances["distribution_shift_mean_normalized_w1"] > 0.0
 
 
@@ -54,6 +58,49 @@ def test_runtime_override_helpers_support_placeholders():
 
     assert resolved["model"]["run"] == "run_0001__baseline"
     assert resolved["sampling"]["num_samples"] == 16
+
+
+def test_tradeoff_label_layout_avoids_overlap_for_close_points():
+    summary_df = pd.DataFrame(
+        [
+            {
+                "case_name": "sample-a",
+                "generated_summary.score_mean": 0.4218,
+                "distribution_distances.distribution_shift_mean_normalized_w1": 220000.0,
+            },
+            {
+                "case_name": "sample-b",
+                "generated_summary.score_mean": 0.4222,
+                "distribution_distances.distribution_shift_mean_normalized_w1": 219900.0,
+            },
+            {
+                "case_name": "sample-c",
+                "generated_summary.score_mean": 0.4226,
+                "distribution_distances.distribution_shift_mean_normalized_w1": 220100.0,
+            },
+            {
+                "case_name": "sample-d",
+                "generated_summary.score_mean": 0.4230,
+                "distribution_distances.distribution_shift_mean_normalized_w1": 220050.0,
+            },
+        ]
+    )
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.8))
+    x_key = "generated_summary.score_mean"
+    y_key = "distribution_distances.distribution_shift_mean_normalized_w1"
+    ax.scatter(summary_df[x_key], summary_df[y_key], s=46, color="tab:blue")
+    ax.margins(x=0.14, y=0.10)
+    annotations = _add_tradeoff_labels(ax, summary_df, x_key=x_key, y_key=y_key)
+
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    boxes = [annotation.get_window_extent(renderer).expanded(1.01, 1.08) for annotation in annotations]
+    assert len(annotations) == len(summary_df)
+    for index, bbox in enumerate(boxes):
+        for other in boxes[index + 1 :]:
+            assert not bbox.overlaps(other)
+    plt.close(fig)
 
 
 def test_run_study_from_config_executes_sample_case_and_writes_reports(tmp_path):
@@ -141,12 +188,49 @@ def test_run_study_from_config_executes_sample_case_and_writes_reports(tmp_path)
     assert report_path.exists()
     with open(report_path, "r", encoding="utf-8") as f:
         report_payload = json.load(f)
+    assert report_payload["status"] == "completed"
     summary_csv_path = Path(report_payload["summary_csv_path"])
+    summary_json_path = Path(report_payload["summary_json_path"])
     case_results_path = Path(report_payload["case_results_path"])
     assert summary_csv_path.exists()
+    assert summary_json_path.exists()
     assert case_results_path.exists()
     figure_paths = report_payload["figure_paths_by_case"]["sample-unguided"]
+    case_report_path = Path(report_payload["case_report_paths_by_case"]["sample-unguided"])
+    assert case_report_path.exists()
     assert Path(figure_paths["score_distribution"]).exists()
     assert Path(figure_paths["representative_gallery"]).exists()
     assert Path(figure_paths["outlier_gallery"]).exists()
     assert Path(figure_paths["pca_projection"]).exists()
+
+    with open(case_results_path, "r", encoding="utf-8") as f:
+        case_results_payload = json.load(f)
+    sample_case_result = case_results_payload["sample-unguided"]
+    samples_out_path = Path(sample_case_result["samples_out_path"])
+    with np.load(samples_out_path, allow_pickle=True) as npz_data:
+        coords = np.asarray(npz_data["coords"], dtype=np.float32)
+        meta = dict(npz_data["meta"].item())
+    np.savez_compressed(
+        samples_out_path,
+        coords=(coords * 1.25 + np.asarray([0.40, -0.30], dtype=np.float32)).astype(np.float32),
+        n=np.int32(coords.shape[1]),
+        meta={**meta, "canonicalize_output": False},
+    )
+
+    report_path.unlink()
+    summary_csv_path.unlink()
+    summary_json_path.unlink()
+
+    refreshed_report_path = refresh_study_outputs(Path(report_payload["study_dir"]))
+    assert refreshed_report_path.exists()
+    with open(refreshed_report_path, "r", encoding="utf-8") as f:
+        refreshed_report_payload = json.load(f)
+    assert refreshed_report_payload["status"] == "completed"
+    assert Path(refreshed_report_payload["summary_csv_path"]).exists()
+    refreshed_dataset = load_polygon_dataset(samples_out_path)
+    refreshed_summary = summarize_polygon_dataset(refreshed_dataset)
+    assert refreshed_summary["raw_centroid_norm_mean"] < 1e-5
+    assert abs(refreshed_summary["raw_rms_radius_mean"] - 1.0) < 1e-5
+
+    refreshed_summary_df = pd.read_csv(Path(refreshed_report_payload["summary_csv_path"]))
+    assert "distribution_distances.shape_distribution_shift_mean_normalized_w1" in refreshed_summary_df.columns

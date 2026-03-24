@@ -146,6 +146,7 @@ def test_restoration_toggle_is_explicit_in_sampling_request(tmp_path):
         animation_fps=None,
     )
     assert regularity_request.restoration is None
+    assert regularity_request.canonicalize_output is True
     assert regularity_request.guidance.enabled
     assert regularity_request.guidance.components[0].kind == "regularity"
 
@@ -166,6 +167,7 @@ def test_restoration_toggle_is_explicit_in_sampling_request(tmp_path):
         animation_fps=None,
     )
     assert disabled_request.restoration is None
+    assert disabled_request.canonicalize_output is True
 
     multi_request = resolve_sampling_request(
         {
@@ -204,6 +206,7 @@ def test_restoration_toggle_is_explicit_in_sampling_request(tmp_path):
         animation_fps=None,
     )
     assert multi_request.restoration is not None
+    assert multi_request.canonicalize_output is False
     assert [component.kind for component in multi_request.guidance.components] == ["regularity", "restoration"]
     assert multi_request.restoration.ligand_binding_site == pytest.approx((1.0, 0.0))
     assert multi_request.restoration.dna_binding_threshold == pytest.approx(0.7)
@@ -233,8 +236,34 @@ def test_restoration_toggle_is_explicit_in_sampling_request(tmp_path):
         animation_fps=None,
     )
     assert legacy_alias_request.restoration is not None
+    assert legacy_alias_request.canonicalize_output is False
     assert legacy_alias_request.restoration.ligand_binding_site == pytest.approx((1.0, 0.0))
     assert legacy_alias_request.restoration.dna_unbound_position == pytest.approx((2.0, 0.0))
+
+    with pytest.raises(ValueError, match="canonicalize_output"):
+        resolve_sampling_request(
+            {
+                "num_samples": 2,
+                "canonicalize_output": True,
+                "restoration": {
+                    "enabled": True,
+                    "target_points": [[-1.0, -0.8], [0.8, -0.7], [1.0, 0.2]],
+                    "binding_site": [1.0, 0.0],
+                    "mutant_position": [2.0, 0.0],
+                    "wild_type_position": [0.0, 0.0],
+                },
+                "guidance": {"enabled": False},
+            },
+            checkpoint_n_steps=8,
+            default_out_path=tmp_path / "samples_canonicalized_restoration.npz",
+            default_animation_out_path=tmp_path / "animations_canonicalized_restoration",
+            enable_animation=False,
+            animation_out_path=None,
+            animation_count=None,
+            animation_sample_index=None,
+            animation_max_frames=None,
+            animation_fps=None,
+        )
 
     with pytest.raises(ValueError, match="restoration guidance requires sampling.restoration.enabled"):
         resolve_sampling_request(

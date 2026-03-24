@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from .. import paths
+from ..data.gen_polygons import normalize_pose_xy
 from ..runs import (
     create_sampling_run_paths,
     infer_run_name_from_checkpoint_path,
@@ -52,6 +53,93 @@ class SampleRunResult:
     run_name: str | None
     sample_run_name: str | None
     config_path: Path
+
+
+def _npz_meta_dict(npz_data: np.lib.npyio.NpzFile) -> dict[str, object]:
+    if "meta" not in npz_data:
+        return {}
+    meta_value = npz_data["meta"]
+    try:
+        decoded = meta_value.item()
+    except ValueError:
+        return {}
+    return dict(decoded) if isinstance(decoded, dict) else {}
+
+
+def _canonicalize_sample_coords(
+    coords: np.ndarray,
+    *,
+    num_vertices: np.ndarray | None,
+) -> np.ndarray:
+    coords_array = np.asarray(coords, dtype=np.float32)
+    if num_vertices is None:
+        return np.stack([normalize_pose_xy(xy) for xy in coords_array], axis=0).astype(np.float32, copy=False)
+
+    num_vertices_array = np.asarray(num_vertices, dtype=np.int32).reshape(-1)
+    if coords_array.ndim != 2 or coords_array.shape[-1] != 2:
+        raise ValueError(
+            "ragged polygon coordinates must have shape (total_vertices, 2), "
+            f"got {coords_array.shape}"
+        )
+    canonical = np.empty_like(coords_array, dtype=np.float32)
+    start = 0
+    for n_vertices in num_vertices_array.tolist():
+        end = start + int(n_vertices)
+        canonical[start:end] = normalize_pose_xy(coords_array[start:end])
+        start = end
+    return canonical
+
+
+def rewrite_sample_archive(
+    samples_out_path: Path,
+    *,
+    canonicalize_output: bool,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    with np.load(samples_out_path, allow_pickle=True) as npz_data:
+        coords = np.asarray(npz_data["coords"], dtype=np.float32)
+        num_vertices = (
+            None
+            if "num_vertices" not in npz_data
+            else np.asarray(npz_data["num_vertices"], dtype=np.int32).reshape(-1)
+        )
+        uniform_n = None if "n" not in npz_data else int(np.asarray(npz_data["n"]).reshape(()))
+        meta = _npz_meta_dict(npz_data)
+
+    if num_vertices is None and coords.ndim == 2:
+        if uniform_n is None:
+            raise ValueError(
+                "uniform 2D sample archives require scalar n metadata to reconstruct polygon boundaries"
+            )
+        if coords.shape[0] % uniform_n != 0:
+            raise ValueError(
+                f"coords row count {coords.shape[0]} is not divisible by stored n={uniform_n}"
+            )
+        coords = coords.reshape(coords.shape[0] // uniform_n, uniform_n, 2)
+
+    rewritten_coords = coords
+    if canonicalize_output:
+        rewritten_coords = _canonicalize_sample_coords(coords, num_vertices=num_vertices)
+    rewritten_coords = np.asarray(rewritten_coords, dtype=np.float32)
+    meta["canonicalize_output"] = bool(canonicalize_output)
+
+    if num_vertices is None:
+        if rewritten_coords.ndim != 3:
+            raise ValueError(f"uniform sample archives must store dense coords with shape (num_polygons, n, 2), got {rewritten_coords.shape}")
+        np.savez_compressed(
+            samples_out_path,
+            coords=rewritten_coords,
+            n=np.int32(rewritten_coords.shape[1]),
+            meta=meta,
+        )
+        return rewritten_coords, None
+
+    np.savez_compressed(
+        samples_out_path,
+        coords=rewritten_coords,
+        num_vertices=np.asarray(num_vertices, dtype=np.int32),
+        meta=meta,
+    )
+    return rewritten_coords, np.asarray(num_vertices, dtype=np.int32)
 
 
 def build_sampling_run_label(cfg: dict[str, object], sampling_cfg: dict[str, object]) -> str:
@@ -255,6 +343,7 @@ def sample_from_loaded_config(
                 "num_samples": request.num_samples,
                 "n_steps": request.n_steps,
                 "out_path": str(request.out_path),
+                "canonicalize_output": request.canonicalize_output,
                 "guidance": _resolved_guidance_config(request.guidance),
                 "diagnostics": {
                     **(sampling_cfg.get("diagnostics") or {}),
@@ -297,6 +386,7 @@ def sample_from_loaded_config(
                 "checkpoint_path": str(checkpoint_path),
                 "model_run_name": run_name,
                 "sample_out_path": str(request.out_path),
+                "canonicalize_output": request.canonicalize_output,
             },
         )
 
@@ -423,6 +513,7 @@ def sample_from_loaded_config(
         num_samples=request.num_samples,
         n_steps=request.n_steps,
         checkpoint_n_steps=diffusion_config.n_steps,
+        canonicalize_output=bool(request.canonicalize_output),
     )
     if request.size_distribution is not None:
         meta["requested_size_distribution"] = {
@@ -434,6 +525,8 @@ def sample_from_loaded_config(
         n_vertices = int(sample_num_vertices[0])
         samples_np = samples.detach().cpu().numpy().reshape(request.num_samples, n_vertices, 2).astype(np.float32)
         sample_num_vertices_np = np.full((request.num_samples,), n_vertices, dtype=np.int32)
+        if request.canonicalize_output:
+            samples_np = _canonicalize_sample_coords(samples_np, num_vertices=None)
         np.savez_compressed(
             request.out_path,
             coords=samples_np,
@@ -446,6 +539,8 @@ def sample_from_loaded_config(
         if np.all(sample_num_vertices_np == sample_num_vertices_np[0]):
             n_vertices = int(sample_num_vertices_np[0])
             samples_np = samples_raw.reshape(request.num_samples, n_vertices, 2)
+            if request.canonicalize_output:
+                samples_np = _canonicalize_sample_coords(samples_np, num_vertices=None)
             np.savez_compressed(
                 request.out_path,
                 coords=samples_np,
@@ -454,6 +549,8 @@ def sample_from_loaded_config(
             )
         else:
             samples_np = samples_raw
+            if request.canonicalize_output:
+                samples_np = _canonicalize_sample_coords(samples_np, num_vertices=sample_num_vertices_np)
             np.savez_compressed(
                 request.out_path,
                 coords=samples_np,
@@ -488,6 +585,7 @@ def sample_from_loaded_config(
         options=request.diagnostics,
         sampling_n_steps=request.n_steps,
         sample_run_name=None if sample_run_paths is None else sample_run_paths.sample_run_name,
+        output_pose_normalized=request.canonicalize_output,
         restoration=request.restoration,
         restoration_trajectory=None if restoration_recorder is None else restoration_recorder.to_dict(),
     )

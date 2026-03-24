@@ -22,6 +22,9 @@ sampling:
   # Optional explicit sample output path. By default this becomes:
   # data/processed/<run_name>/sample_0001__.../samples.npz
   # out_path: "data/processed/custom_samples.npz"
+  # Recenter, RMS-normalize, and enforce CCW on saved polygons.
+  # Defaults to true for ordinary sampling and false for restoration scenes.
+  # canonicalize_output: true
   # Optional classifier, regressor, analytic regularity, analytic area, or
   # analytic restoration guidance.
   # The sampler itself is architecture-agnostic:

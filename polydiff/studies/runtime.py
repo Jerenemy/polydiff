@@ -232,6 +232,9 @@ def write_study_metadata(path: Path, *, spec: StudySpec, paths_obj: StudyPaths) 
         "study_name": paths_obj.study_name,
         "study_number": paths_obj.study_number,
         "study_dir": str(paths_obj.study_dir),
+        "configs_dir": str(paths_obj.configs_dir),
+        "reports_dir": str(paths_obj.reports_dir),
+        "figures_dir": str(paths_obj.figures_dir),
         "source_config_path": str(spec.config_path),
         "summary": {
             "reference_data_path": None if spec.summary.reference_data_path is None else str(spec.summary.reference_data_path),

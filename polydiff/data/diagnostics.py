@@ -13,21 +13,28 @@ from .gen_polygons import (
     edge_lengths,
     enforce_ccw,
     is_self_intersecting,
+    normalize_pose_xy,
     normalize_scale_rms,
     polygon_signed_area_xy,
     regularity_score,
 )
 from .polygon_dataset import PolygonDatasetArrays, vertex_count_histogram
 
-DEFAULT_DISTRIBUTION_METRICS = (
+DEFAULT_SHAPE_DISTRIBUTION_METRICS = (
     "score",
     "edge_cv",
     "angle_cv",
     "radius_cv",
-    "raw_centroid_norm",
-    "raw_rms_radius",
     "area",
     "compactness",
+)
+DEFAULT_POSE_DISTRIBUTION_METRICS = (
+    "raw_centroid_norm",
+    "raw_rms_radius",
+)
+DEFAULT_DISTRIBUTION_METRICS = (
+    *DEFAULT_SHAPE_DISTRIBUTION_METRICS,
+    *DEFAULT_POSE_DISTRIBUTION_METRICS,
 )
 DEFAULT_SCORE_THRESHOLDS = (0.90, 0.95)
 PER_POLYGON_METRIC_COLUMNS = (
@@ -55,10 +62,7 @@ def anchor_index(xy: np.ndarray) -> int:
 
 def canonicalize_polygon(xy: np.ndarray) -> np.ndarray:
     """Center, normalize, orient, and cyclically align a polygon."""
-    xy = np.asarray(xy, dtype=np.float64)
-    xy = xy - centroid_xy(xy)
-    xy = normalize_scale_rms(xy)
-    xy = enforce_ccw(xy)
+    xy = normalize_pose_xy(xy).astype(np.float64, copy=False)
 
     start = anchor_index(xy)
     xy = np.roll(xy, -start, axis=0)
@@ -192,6 +196,7 @@ def compare_polygon_metric_tables(
     """Compare two per-polygon metric tables using distribution distances."""
     distances: dict[str, float] = {}
     normalized_w1_values: list[float] = []
+    normalized_w1_by_metric: dict[str, float] = {}
     for metric in metric_names:
         if metric not in reference_table.columns or metric not in observed_table.columns:
             continue
@@ -205,9 +210,19 @@ def compare_polygon_metric_tables(
         distances[f"{metric}_ks"] = float(ks)
         distances[f"{metric}_normalized_w1"] = float(normalized_w1)
         normalized_w1_values.append(normalized_w1)
+        normalized_w1_by_metric[metric] = float(normalized_w1)
+
+    def _aggregate_shift(metric_subset: tuple[str, ...], *, prefix: str) -> None:
+        values = [normalized_w1_by_metric[metric] for metric in metric_subset if metric in normalized_w1_by_metric]
+        if values:
+            distances[f"{prefix}_distribution_shift_mean_normalized_w1"] = float(np.mean(values))
+            distances[f"{prefix}_distribution_shift_max_normalized_w1"] = float(np.max(values))
+
     if normalized_w1_values:
         distances["distribution_shift_mean_normalized_w1"] = float(np.mean(normalized_w1_values))
         distances["distribution_shift_max_normalized_w1"] = float(np.max(normalized_w1_values))
+    _aggregate_shift(DEFAULT_SHAPE_DISTRIBUTION_METRICS, prefix="shape")
+    _aggregate_shift(DEFAULT_POSE_DISTRIBUTION_METRICS, prefix="pose")
     return distances
 
 

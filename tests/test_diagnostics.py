@@ -1,9 +1,11 @@
 import numpy as np
 
 from polydiff.data.diagnostics import (
+    compare_polygon_metric_tables,
     compare_polygon_summaries,
     format_polygon_delta_summary,
     format_polygon_summary,
+    polygon_metric_table,
     summarize_polygon_dataset,
 )
 from polydiff.data.gen_polygons import batch, make_polygon
@@ -36,6 +38,20 @@ def test_compare_polygon_summaries_detects_distribution_shift():
     assert deltas["angle_cv_mean_delta"] > 0.0
     assert "score" in format_polygon_delta_summary(deltas)
     assert "score=" in format_polygon_summary(summary_a)
+
+
+def test_metric_table_split_distinguishes_shape_shift_from_pose_drift():
+    coords, _, _ = batch(n=6, num=24, seed=3)
+    shifted_scaled = (coords * 1.35) + np.asarray([0.25, -0.40], dtype=np.float32)
+
+    distances = compare_polygon_metric_tables(
+        reference_table=polygon_metric_table(coords),
+        observed_table=polygon_metric_table(shifted_scaled),
+    )
+
+    assert distances["shape_distribution_shift_mean_normalized_w1"] < 1e-2
+    assert distances["pose_distribution_shift_mean_normalized_w1"] > 1e-2
+    assert distances["distribution_shift_mean_normalized_w1"] > distances["shape_distribution_shift_mean_normalized_w1"]
 
 
 def test_summarize_polygon_dataset_handles_ragged_storage():
