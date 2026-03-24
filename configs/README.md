@@ -7,6 +7,7 @@ Main files:
 - `train_diffusion.yaml`: diffusion-denoiser training
 - `sample_diffusion.yaml`: sampling, guidance, diagnostics, and animation export
 - `train_guidance_model.yaml`: classifier/regressor guidance-model training
+- `study_minimum_high_honors.yaml`: example multi-case study manifest
 
 Important compatibility rules:
 
@@ -24,5 +25,13 @@ Important sampling knobs:
 - `sampling.restoration.*`: explicit opt-in ligand -> restored protein -> DNA-binding scene used by restoration guidance, diagnostics, and GIF overlays
 - `sampling.diagnostics.*`: reference comparison JSON output
 - `sampling.animation.*`: GIF export of reverse trajectories
+
+Important study-manifest knobs:
+
+- `study.root_dir`: where numbered `study_*` folders are written
+- `study.summary.reference_data_path`: reference dataset used for galleries and PCA
+- `cases[*].kind`: `train_diffusion` | `train_guidance_model` | `sample_diffusion`
+- `cases[*].overrides`: dotted-path config overrides applied to the case config
+- placeholder values such as `{{train-mlp.run_name}}` let later cases consume earlier outputs
 
 If `sampling.size_distribution` is omitted for a GAT/GCN checkpoint, sampling defaults to the empirical training-size histogram saved in the checkpoint metadata.

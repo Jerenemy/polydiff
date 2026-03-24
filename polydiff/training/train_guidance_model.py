@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
 import time
 
@@ -19,6 +20,14 @@ from ..models.diffusion import Diffusion, DiffusionConfig
 from ..utils.runtime import device_from_config, load_yaml_config, resolve_project_path, set_seed
 
 
+@dataclass(frozen=True, slots=True)
+class GuidanceTrainResult:
+    checkpoint_path: Path
+    guidance_task: str
+    training_data_path: Path
+    config_path: Path
+
+
 class _UnusedDenoiser(nn.Module):
     """Only used to reuse Diffusion.q_sample for guidance-model training."""
 
@@ -32,9 +41,7 @@ def _load_scores(coords: np.ndarray, npz_data: np.lib.npyio.NpzFile) -> np.ndarr
     return np.asarray([regularity_score(xy).score for xy in coords], dtype=np.float32)
 
 
-def train_guidance_model_from_config(config_path: Path) -> None:
-    cfg = load_yaml_config(config_path)
-
+def train_guidance_model_from_loaded_config(cfg: dict[str, object], *, config_path: Path) -> GuidanceTrainResult:
     seed = int(cfg.get("seed", 0))
     set_seed(seed)
 
@@ -240,6 +247,17 @@ def train_guidance_model_from_config(config_path: Path) -> None:
         }
     torch.save(payload, final_path)
     print(f"[guidance-train] saved final checkpoint {final_path} at step={global_step}")
+    return GuidanceTrainResult(
+        checkpoint_path=final_path,
+        guidance_task=guidance_task,
+        training_data_path=data_path,
+        config_path=config_path,
+    )
+
+
+def train_guidance_model_from_config(config_path: Path) -> GuidanceTrainResult:
+    cfg = load_yaml_config(config_path)
+    return train_guidance_model_from_loaded_config(cfg, config_path=config_path)
 
 
 def main() -> None:

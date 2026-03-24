@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
 import time
 
@@ -31,6 +32,15 @@ from .runtime import (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class TrainRunResult:
+    run_name: str
+    model_dir: Path
+    processed_dir: Path
+    checkpoint_path: Path
+    config_path: Path
+
+
 class _PolygonArrayDataset(Dataset[torch.Tensor]):
     def __init__(self, data: PolygonDatasetArrays) -> None:
         self.data = data
@@ -42,9 +52,7 @@ class _PolygonArrayDataset(Dataset[torch.Tensor]):
         return torch.from_numpy(self.data.polygon(index))
 
 
-def train_from_config(config_path: Path) -> None:
-    cfg = load_yaml_config(config_path)
-
+def train_from_loaded_config(cfg: dict[str, object], *, config_path: Path) -> TrainRunResult:
     seed = int(cfg.get("seed", 0))
     set_seed(seed)
 
@@ -292,6 +300,18 @@ def train_from_config(config_path: Path) -> None:
         config_path=config_path,
     )
     log_training_end(logger=logger, metrics_path=metrics_path, final_checkpoint=final_path, final_step=global_step)
+    return TrainRunResult(
+        run_name=run_paths.run_name,
+        model_dir=run_paths.model_dir,
+        processed_dir=run_paths.processed_dir,
+        checkpoint_path=final_path,
+        config_path=config_path,
+    )
+
+
+def train_from_config(config_path: Path) -> TrainRunResult:
+    cfg = load_yaml_config(config_path)
+    return train_from_loaded_config(cfg, config_path=config_path)
 
 
 def main() -> None:

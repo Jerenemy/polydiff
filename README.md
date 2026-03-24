@@ -21,6 +21,7 @@ Variable-size polygon data is stored raggedly as concatenated `coords` plus a pe
 - `configs/`: YAML configs for training and sampling
 - `scripts/`: CLI wrappers
 - `data/`: raw datasets and generated samples, organized per run under `data/processed/run_*`
+- `data/studies/`: cross-run study manifests, summaries, and figure outputs
 - `models/`: local checkpoints, logs, and config snapshots, organized per run under `models/run_*`
 - `pretrained_models/`: externally trained checkpoints
 - `notebooks/`: exploratory analysis
@@ -218,6 +219,30 @@ Sampling writes into a numbered sampling subfolder under the model run:
 
 - `data/processed/run_####__.../sample_0001__.../samples.npz`
 - `data/processed/run_####__.../sample_0001__.../samples.diagnostics.json`
+- `data/processed/run_####__.../sample_0001__.../samples.metrics.csv`
+
+## Studies
+
+Use the study runner when you want a reproducible thesis-style sweep instead of one-off runs.
+
+```bash
+python -m polydiff.studies.run --config configs/study_minimum_high_honors.yaml
+```
+
+Study cases can:
+
+- train diffusion runs
+- train learned guidance models
+- sample diffusion checkpoints
+
+Each study writes a numbered folder under `data/studies/` containing:
+
+- resolved per-case configs
+- case result metadata
+- sample-case summary CSV/JSON
+- score-distribution, PCA, representative-sample, and outlier galleries when reference data is available
+
+The study manifest supports placeholder references such as `{{train-mlp.run_name}}` so later cases can consume earlier outputs.
 - `data/processed/run_####__.../sample_0001__.../media/animations/sample_0000.gif` and friends when animation export is enabled
 - `data/processed/run_####__.../sample_0001__.../media/notebooks/compare_polygon_distributions/*.png` for saved notebook comparison figures
 

@@ -253,6 +253,64 @@ AtomicSamplingGuidance = (
 
 
 @dataclass(frozen=True, slots=True)
+class GuidanceSchedule:
+    kind: str
+    num_steps: int
+    start_frac: float = 0.0
+    end_frac: float = 1.0
+    min_scale: float = 0.0
+
+    def weights(self, t: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
+        if t.ndim != 1:
+            raise ValueError(f"t must have shape (batch,), got {tuple(t.shape)}")
+        if self.num_steps <= 1:
+            return torch.ones_like(t, dtype=dtype)
+        progress = 1.0 - t.to(dtype) / float(self.num_steps - 1)
+        progress = progress.clamp(0.0, 1.0)
+        kind = self.kind.lower()
+        if kind == "all":
+            return torch.ones_like(progress, dtype=dtype)
+        if kind == "early":
+            return (progress <= 0.30).to(dtype)
+        if kind == "mid":
+            return ((progress >= 0.30) & (progress < 0.70)).to(dtype)
+        if kind == "late":
+            return (progress >= 0.70).to(dtype)
+        if kind == "window":
+            return ((progress >= float(self.start_frac)) & (progress <= float(self.end_frac))).to(dtype)
+        if kind == "linear_ramp":
+            return float(self.min_scale) + (1.0 - float(self.min_scale)) * progress
+        if kind == "quadratic_ramp":
+            return float(self.min_scale) + (1.0 - float(self.min_scale)) * progress.square()
+        decay_progress = 1.0 - progress
+        if kind == "linear_decay":
+            return float(self.min_scale) + (1.0 - float(self.min_scale)) * decay_progress
+        if kind == "quadratic_decay":
+            return float(self.min_scale) + (1.0 - float(self.min_scale)) * decay_progress.square()
+        raise ValueError(f"Unsupported guidance schedule {self.kind!r}")
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduledGuidance:
+    guidance: AtomicSamplingGuidance | CompositeGuidance
+    schedule: GuidanceSchedule
+
+    def __call__(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        *,
+        graph_batch: PolygonGraphBatch | None = None,
+    ) -> torch.Tensor:
+        grad = self.guidance(x_t, t, graph_batch=graph_batch)
+        weights = self.schedule.weights(t, dtype=grad.dtype)
+        if graph_batch is None:
+            return grad * weights.unsqueeze(1)
+        node_weights = weights.index_select(0, graph_batch.graph_index).unsqueeze(1)
+        return grad * node_weights
+
+
+@dataclass(frozen=True, slots=True)
 class CompositeGuidance:
     components: tuple[AtomicSamplingGuidance, ...]
 
@@ -269,7 +327,7 @@ class CompositeGuidance:
         return grad_total
 
 
-SamplingGuidance = AtomicSamplingGuidance | CompositeGuidance
+SamplingGuidance = AtomicSamplingGuidance | CompositeGuidance | ScheduledGuidance
 
 
 def _restoration_timestep_weight(
@@ -320,11 +378,39 @@ def load_sampling_guidance(
     alpha: float = 8.0,
     beta: float = 5.0,
     gamma: float = 4.0,
+    schedule: str = "all",
+    schedule_start: float = 0.0,
+    schedule_end: float = 1.0,
+    schedule_min_scale: float = 0.0,
     min_timestep_weight: float = 0.05,
     timestep_power: float = 2.0,
     restoration: RestorationProxyConfig | None = None,
 ) -> tuple[dict[str, Any], SamplingGuidance, int | None]:
     task = str(kind).lower()
+    schedule_name = str(schedule).lower()
+
+    def _wrap_schedule(metadata: dict[str, Any], guidance: SamplingGuidance) -> tuple[dict[str, Any], SamplingGuidance]:
+        if schedule_name == "all":
+            return metadata, guidance
+        if num_steps is None:
+            raise ValueError("num_steps is required when sampling.guidance.schedule is not 'all'")
+        metadata = {
+            **metadata,
+            "guidance_schedule": schedule_name,
+            "guidance_schedule_start": float(schedule_start),
+            "guidance_schedule_end": float(schedule_end),
+            "guidance_schedule_min_scale": float(schedule_min_scale),
+        }
+        return metadata, ScheduledGuidance(
+            guidance=guidance,
+            schedule=GuidanceSchedule(
+                kind=schedule_name,
+                num_steps=int(num_steps),
+                start_frac=float(schedule_start),
+                end_frac=float(schedule_end),
+                min_scale=float(schedule_min_scale),
+            ),
+        )
 
     if task == "regularity":
         metadata = {
@@ -343,6 +429,7 @@ def load_sampling_guidance(
             beta=float(beta),
             gamma=float(gamma),
         )
+        metadata, guidance = _wrap_schedule(metadata, guidance)
         return metadata, guidance, None if n_vertices is None else int(n_vertices)
 
     if task == "area":
@@ -358,6 +445,7 @@ def load_sampling_guidance(
             target_value=None if target_value is None else float(target_value),
             absolute=True,
         )
+        metadata, guidance = _wrap_schedule(metadata, guidance)
         return metadata, guidance, None if n_vertices is None else int(n_vertices)
 
     if task == "restoration":
@@ -383,6 +471,7 @@ def load_sampling_guidance(
             min_timestep_weight=float(min_timestep_weight),
             timestep_power=float(timestep_power),
         )
+        metadata, guidance = _wrap_schedule(metadata, guidance)
         return metadata, guidance, None if n_vertices is None else int(n_vertices)
 
     if checkpoint_path is None:
@@ -415,6 +504,7 @@ def load_sampling_guidance(
             scale=float(scale),
             target_class=1 if target_class is None else int(target_class),
         )
+        checkpoint, guidance = _wrap_schedule(dict(checkpoint), guidance)
         return checkpoint, guidance, n_vertices
 
     if task == "regressor":
@@ -431,6 +521,7 @@ def load_sampling_guidance(
             scale=float(scale),
             target_value=None if target_value is None else float(target_value),
         )
+        checkpoint, guidance = _wrap_schedule(dict(checkpoint), guidance)
         return checkpoint, guidance, n_vertices
 
     raise ValueError(

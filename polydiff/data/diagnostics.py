@@ -6,6 +6,7 @@ import math
 from typing import Any
 
 import numpy as np
+import pandas as pd
 
 from .gen_polygons import (
     centroid_xy,
@@ -17,6 +18,34 @@ from .gen_polygons import (
     regularity_score,
 )
 from .polygon_dataset import PolygonDatasetArrays, vertex_count_histogram
+
+DEFAULT_DISTRIBUTION_METRICS = (
+    "score",
+    "edge_cv",
+    "angle_cv",
+    "radius_cv",
+    "raw_centroid_norm",
+    "raw_rms_radius",
+    "area",
+    "compactness",
+)
+DEFAULT_SCORE_THRESHOLDS = (0.90, 0.95)
+PER_POLYGON_METRIC_COLUMNS = (
+    "polygon_index",
+    "num_vertices",
+    "raw_centroid_norm",
+    "raw_rms_radius",
+    "raw_ccw",
+    "self_intersection",
+    "score",
+    "edge_cv",
+    "angle_cv",
+    "radius_cv",
+    "area",
+    "compactness",
+    "min_radius",
+    "max_radius",
+)
 
 
 def anchor_index(xy: np.ndarray) -> int:
@@ -72,6 +101,188 @@ def polygon_metric_row(xy: np.ndarray) -> dict[str, float]:
         "min_radius": float(radii.min()),
         "max_radius": float(radii.max()),
     }
+
+
+def polygon_metric_table(
+    coords: np.ndarray | PolygonDatasetArrays,
+    num_vertices: np.ndarray | None = None,
+) -> pd.DataFrame:
+    """Return one metrics row per polygon."""
+    dataset = _as_polygon_dataset(coords, num_vertices=num_vertices)
+    rows: list[dict[str, float | int]] = []
+    for polygon_index, xy in enumerate(dataset.iter_polygons()):
+        row = polygon_metric_row(xy)
+        row_with_index: dict[str, float | int] = {
+            "polygon_index": int(polygon_index),
+            "num_vertices": int(dataset.num_vertices[polygon_index]),
+            "raw_ccw": int(row["raw_ccw"]),
+            **row,
+        }
+        rows.append(row_with_index)
+    return pd.DataFrame(rows, columns=PER_POLYGON_METRIC_COLUMNS)
+
+
+def canonical_polygon_feature_matrix(
+    coords: np.ndarray | PolygonDatasetArrays,
+    num_vertices: np.ndarray | None = None,
+) -> np.ndarray:
+    """Return flattened canonical polygon coordinates for uniform-size datasets."""
+    dataset = _as_polygon_dataset(coords, num_vertices=num_vertices)
+    if not dataset.is_uniform:
+        raise ValueError("canonical feature matrix requires a uniform polygon size")
+    features = [
+        canonicalize_polygon(xy).reshape(-1).astype(np.float64, copy=False)
+        for xy in dataset.iter_polygons()
+    ]
+    return np.stack(features, axis=0) if features else np.empty((0, 0), dtype=np.float64)
+
+
+def _threshold_key(value: float) -> str:
+    return str(float(value)).replace("-", "m").replace(".", "p")
+
+
+def metric_threshold_rates(
+    values: np.ndarray,
+    *,
+    metric_name: str,
+    thresholds: tuple[float, ...] = DEFAULT_SCORE_THRESHOLDS,
+) -> dict[str, float]:
+    values_array = np.asarray(values, dtype=np.float64).reshape(-1)
+    return {
+        f"{metric_name}_ge_{_threshold_key(threshold)}_rate": float((values_array >= float(threshold)).mean())
+        for threshold in thresholds
+    }
+
+
+def empirical_quantile_distance(
+    reference: np.ndarray,
+    observed: np.ndarray,
+    *,
+    num_quantiles: int = 257,
+) -> float:
+    """Approximate 1D Wasserstein distance using matched empirical quantiles."""
+    reference_array = np.asarray(reference, dtype=np.float64).reshape(-1)
+    observed_array = np.asarray(observed, dtype=np.float64).reshape(-1)
+    if reference_array.size == 0 or observed_array.size == 0:
+        raise ValueError("quantile distance requires non-empty arrays")
+    quantiles = np.linspace(0.0, 1.0, num=num_quantiles, dtype=np.float64)
+    ref_q = np.quantile(reference_array, quantiles)
+    obs_q = np.quantile(observed_array, quantiles)
+    return float(np.mean(np.abs(ref_q - obs_q)))
+
+
+def kolmogorov_smirnov_distance(reference: np.ndarray, observed: np.ndarray) -> float:
+    """Return the two-sample KS distance without requiring scipy."""
+    reference_array = np.sort(np.asarray(reference, dtype=np.float64).reshape(-1))
+    observed_array = np.sort(np.asarray(observed, dtype=np.float64).reshape(-1))
+    if reference_array.size == 0 or observed_array.size == 0:
+        raise ValueError("KS distance requires non-empty arrays")
+    support = np.concatenate([reference_array, observed_array], axis=0)
+    ref_cdf = np.searchsorted(reference_array, support, side="right") / float(reference_array.size)
+    obs_cdf = np.searchsorted(observed_array, support, side="right") / float(observed_array.size)
+    return float(np.max(np.abs(ref_cdf - obs_cdf)))
+
+
+def compare_polygon_metric_tables(
+    reference_table: pd.DataFrame,
+    observed_table: pd.DataFrame,
+    *,
+    metric_names: tuple[str, ...] = DEFAULT_DISTRIBUTION_METRICS,
+) -> dict[str, float]:
+    """Compare two per-polygon metric tables using distribution distances."""
+    distances: dict[str, float] = {}
+    normalized_w1_values: list[float] = []
+    for metric in metric_names:
+        if metric not in reference_table.columns or metric not in observed_table.columns:
+            continue
+        ref_values = reference_table[metric].to_numpy(dtype=np.float64, copy=False)
+        obs_values = observed_table[metric].to_numpy(dtype=np.float64, copy=False)
+        w1 = empirical_quantile_distance(ref_values, obs_values)
+        ks = kolmogorov_smirnov_distance(ref_values, obs_values)
+        ref_scale = max(float(ref_values.std()), 1e-8)
+        normalized_w1 = float(w1 / ref_scale)
+        distances[f"{metric}_w1"] = float(w1)
+        distances[f"{metric}_ks"] = float(ks)
+        distances[f"{metric}_normalized_w1"] = float(normalized_w1)
+        normalized_w1_values.append(normalized_w1)
+    if normalized_w1_values:
+        distances["distribution_shift_mean_normalized_w1"] = float(np.mean(normalized_w1_values))
+        distances["distribution_shift_max_normalized_w1"] = float(np.max(normalized_w1_values))
+    return distances
+
+
+def polygon_anomaly_scores(
+    reference_coords: np.ndarray | PolygonDatasetArrays,
+    observed_coords: np.ndarray | PolygonDatasetArrays,
+    *,
+    reference_num_vertices: np.ndarray | None = None,
+    observed_num_vertices: np.ndarray | None = None,
+) -> np.ndarray:
+    """Score polygons by how atypical they are relative to a reference set."""
+    reference_dataset = _as_polygon_dataset(reference_coords, num_vertices=reference_num_vertices)
+    observed_dataset = _as_polygon_dataset(observed_coords, num_vertices=observed_num_vertices)
+
+    reference_table = polygon_metric_table(reference_dataset)
+    observed_table = polygon_metric_table(observed_dataset)
+
+    metric_names = ("score", "edge_cv", "angle_cv", "radius_cv", "raw_centroid_norm", "raw_rms_radius", "area")
+    reference_metrics = reference_table.loc[:, metric_names].to_numpy(dtype=np.float64, copy=False)
+    observed_metrics = observed_table.loc[:, metric_names].to_numpy(dtype=np.float64, copy=False)
+    metric_mean = reference_metrics.mean(axis=0)
+    metric_std = np.maximum(reference_metrics.std(axis=0), 1e-6)
+    metric_anomaly = np.mean(np.abs(observed_metrics - metric_mean) / metric_std, axis=1)
+
+    anomaly = metric_anomaly
+    if (
+        reference_dataset.is_uniform
+        and observed_dataset.is_uniform
+        and int(reference_dataset.num_vertices[0]) == int(observed_dataset.num_vertices[0])
+    ):
+        reference_features = canonical_polygon_feature_matrix(reference_dataset)
+        observed_features = canonical_polygon_feature_matrix(observed_dataset)
+        feature_mean = reference_features.mean(axis=0)
+        feature_std = np.maximum(reference_features.std(axis=0), 1e-6)
+        feature_anomaly = np.mean(np.abs(observed_features - feature_mean) / feature_std, axis=1)
+        anomaly = 0.5 * metric_anomaly + 0.5 * feature_anomaly
+
+    self_intersection_penalty = observed_table["self_intersection"].to_numpy(dtype=np.float64, copy=False)
+    return anomaly + 2.0 * self_intersection_penalty
+
+
+def representative_polygon_indices(
+    reference_coords: np.ndarray | PolygonDatasetArrays,
+    observed_coords: np.ndarray | PolygonDatasetArrays,
+    *,
+    count: int,
+    reference_num_vertices: np.ndarray | None = None,
+    observed_num_vertices: np.ndarray | None = None,
+) -> np.ndarray:
+    scores = polygon_anomaly_scores(
+        reference_coords,
+        observed_coords,
+        reference_num_vertices=reference_num_vertices,
+        observed_num_vertices=observed_num_vertices,
+    )
+    count = max(0, min(int(count), scores.shape[0]))
+    return np.argsort(scores, kind="stable")[:count].astype(np.int32)
+
+
+def outlier_polygon_indices(
+    reference_coords: np.ndarray | PolygonDatasetArrays,
+    observed_coords: np.ndarray | PolygonDatasetArrays,
+    *,
+    count: int,
+    reference_num_vertices: np.ndarray | None = None,
+    observed_num_vertices: np.ndarray | None = None,
+) -> np.ndarray:
+    scores = polygon_anomaly_scores(
+        reference_coords,
+        observed_coords,
+        reference_num_vertices=reference_num_vertices,
+        observed_num_vertices=observed_num_vertices,
+    )
+    count = max(0, min(int(count), scores.shape[0]))
+    return np.argsort(scores, kind="stable")[-count:][::-1].astype(np.int32)
 
 
 def _as_polygon_dataset(

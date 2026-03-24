@@ -43,6 +43,17 @@ class SampleCliOverrides:
     animation_fps: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class SampleRunResult:
+    checkpoint_path: Path
+    samples_out_path: Path
+    diagnostics_path: Path | None
+    metrics_path: Path | None
+    run_name: str | None
+    sample_run_name: str | None
+    config_path: Path
+
+
 def build_sampling_run_label(cfg: dict[str, object], sampling_cfg: dict[str, object]) -> str:
     parts = [str(cfg.get("experiment_name", "polydiff-sample"))]
     guidance_cfg = sampling_cfg.get("guidance")
@@ -165,10 +176,22 @@ def _resolved_guidance_config(guidance: GuidanceOptions) -> dict[str, object]:
     }
 
 
-def sample_from_config(config_path: Path, *, cli_overrides: SampleCliOverrides | None = None) -> None:
-    cli_overrides = cli_overrides or SampleCliOverrides()
+def sample_from_config(
+    config_path: Path,
+    *,
+    cli_overrides: SampleCliOverrides | None = None,
+) -> SampleRunResult:
     cfg = load_yaml_config(config_path)
+    return sample_from_loaded_config(cfg, config_path=config_path, cli_overrides=cli_overrides)
 
+
+def sample_from_loaded_config(
+    cfg: dict[str, object],
+    *,
+    config_path: Path,
+    cli_overrides: SampleCliOverrides | None = None,
+) -> SampleRunResult:
+    cli_overrides = cli_overrides or SampleCliOverrides()
     seed = int(cfg.get("seed", 0))
     set_seed(seed)
 
@@ -308,6 +331,10 @@ def sample_from_config(config_path: Path, *, cli_overrides: SampleCliOverrides |
                 alpha=component.alpha,
                 beta=component.beta,
                 gamma=component.gamma,
+                schedule=component.schedule,
+                schedule_start=component.schedule_start,
+                schedule_end=component.schedule_end,
+                schedule_min_scale=component.schedule_min_scale,
                 min_timestep_weight=component.min_timestep_weight,
                 timestep_power=component.timestep_power,
                 restoration=request.restoration,
@@ -340,6 +367,13 @@ def sample_from_config(config_path: Path, *, cli_overrides: SampleCliOverrides |
                 description += f", target_class={component.target_class}"
             elif component.target_value is not None:
                 description += f", target_value={component.target_value}"
+            if component.schedule != "all":
+                description += (
+                    f", schedule={component.schedule}"
+                    f", schedule_start={component.schedule_start}"
+                    f", schedule_end={component.schedule_end}"
+                    f", schedule_min_scale={component.schedule_min_scale}"
+                )
             description += ")"
             descriptions.append(description)
         print(f"[sample] enabled guidance terms: {', '.join(descriptions)}")
@@ -444,7 +478,7 @@ def sample_from_config(config_path: Path, *, cli_overrides: SampleCliOverrides |
             f"max_frames={request.animation.max_frames}, fps={request.animation.fps})"
         )
 
-    write_sampling_diagnostics(
+    diagnostics_path = write_sampling_diagnostics(
         checkpoint=checkpoint,
         checkpoint_path=checkpoint_path,
         config_path=config_path,
@@ -456,6 +490,16 @@ def sample_from_config(config_path: Path, *, cli_overrides: SampleCliOverrides |
         sample_run_name=None if sample_run_paths is None else sample_run_paths.sample_run_name,
         restoration=request.restoration,
         restoration_trajectory=None if restoration_recorder is None else restoration_recorder.to_dict(),
+    )
+    metrics_path = request.out_path.with_name(f"{request.out_path.stem}.metrics.csv")
+    return SampleRunResult(
+        checkpoint_path=checkpoint_path,
+        samples_out_path=request.out_path,
+        diagnostics_path=diagnostics_path,
+        metrics_path=metrics_path if metrics_path.exists() else None,
+        run_name=run_name or None,
+        sample_run_name=None if sample_run_paths is None else sample_run_paths.sample_run_name,
+        config_path=config_path,
     )
 
 

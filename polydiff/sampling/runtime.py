@@ -11,10 +11,16 @@ import numpy as np
 import torch
 
 from ..data.diagnostics import (
+    DEFAULT_SCORE_THRESHOLDS,
     compare_polygon_summaries,
+    compare_polygon_metric_tables,
     format_polygon_delta_summary,
     format_polygon_summary,
     json_ready,
+    metric_threshold_rates,
+    outlier_polygon_indices,
+    polygon_metric_table,
+    representative_polygon_indices,
     summarize_polygon_dataset,
 )
 from ..data.gen_polygons import normalize_size_distribution
@@ -59,6 +65,10 @@ class GuidanceComponentOptions:
     alpha: float
     beta: float
     gamma: float
+    schedule: str
+    schedule_start: float
+    schedule_end: float
+    schedule_min_scale: float
     min_timestep_weight: float
     timestep_power: float
 
@@ -77,6 +87,11 @@ class GuidanceComponentOptions:
             out["alpha"] = float(self.alpha)
             out["beta"] = float(self.beta)
             out["gamma"] = float(self.gamma)
+        if self.schedule != "all":
+            out["schedule"] = self.schedule
+            out["schedule_start"] = float(self.schedule_start)
+            out["schedule_end"] = float(self.schedule_end)
+            out["schedule_min_scale"] = float(self.schedule_min_scale)
         if self.kind == "restoration":
             out["min_timestep_weight"] = float(self.min_timestep_weight)
             out["timestep_power"] = float(self.timestep_power)
@@ -341,13 +356,44 @@ def _resolve_guidance_component(
     alpha = float(component_cfg.get("alpha", 8.0))
     beta = float(component_cfg.get("beta", 5.0))
     gamma = float(component_cfg.get("gamma", 4.0))
+    schedule = str(component_cfg.get("schedule", "all")).lower()
+    schedule_start = float(component_cfg.get("schedule_start", 0.0))
+    schedule_end = float(component_cfg.get("schedule_end", 1.0))
+    schedule_min_scale = float(component_cfg.get("schedule_min_scale", 0.0))
     min_timestep_weight = float(component_cfg.get("min_timestep_weight", 0.05))
     timestep_power = float(component_cfg.get("timestep_power", 2.0))
+    valid_schedules = {
+        "all",
+        "early",
+        "mid",
+        "late",
+        "window",
+        "linear_ramp",
+        "quadratic_ramp",
+        "linear_decay",
+        "quadratic_decay",
+    }
 
     if scale < 0.0:
         raise ValueError(f"sampling.guidance.scale must be >= 0, got {scale}")
     if checkpoint_path is None and kind_str not in {"regularity", "area", "restoration"}:
         raise ValueError(f"sampling.guidance.checkpoint is required for {kind_str} guidance")
+    if schedule not in valid_schedules:
+        raise ValueError(
+            f"sampling.guidance.schedule must be one of {sorted(valid_schedules)}, got {schedule!r}"
+        )
+    if not 0.0 <= schedule_start <= 1.0:
+        raise ValueError(f"sampling.guidance.schedule_start must be in [0, 1], got {schedule_start}")
+    if not 0.0 <= schedule_end <= 1.0:
+        raise ValueError(f"sampling.guidance.schedule_end must be in [0, 1], got {schedule_end}")
+    if schedule_start > schedule_end:
+        raise ValueError(
+            f"sampling.guidance.schedule_start must be <= schedule_end, got {schedule_start} > {schedule_end}"
+        )
+    if not 0.0 <= schedule_min_scale <= 1.0:
+        raise ValueError(
+            f"sampling.guidance.schedule_min_scale must be in [0, 1], got {schedule_min_scale}"
+        )
     if not 0.0 <= min_timestep_weight <= 1.0:
         raise ValueError(
             f"sampling.guidance.min_timestep_weight must be in [0, 1], got {min_timestep_weight}"
@@ -364,6 +410,10 @@ def _resolve_guidance_component(
         alpha=alpha,
         beta=beta,
         gamma=gamma,
+        schedule=schedule,
+        schedule_start=schedule_start,
+        schedule_end=schedule_end,
+        schedule_min_scale=schedule_min_scale,
         min_timestep_weight=min_timestep_weight,
         timestep_power=timestep_power,
     )
@@ -581,6 +631,10 @@ def default_diagnostics_out_path(samples_out_path: Path) -> Path:
     return samples_out_path.with_name(f"{samples_out_path.stem}.diagnostics.json")
 
 
+def default_metrics_out_path(samples_out_path: Path) -> Path:
+    return samples_out_path.with_name(f"{samples_out_path.stem}.metrics.csv")
+
+
 def resolve_reference_summary(
     checkpoint: dict[str, Any],
     options: DiagnosticsOptions,
@@ -623,13 +677,45 @@ def write_sampling_diagnostics(
     if not options.enabled:
         return None
 
+    generated_table = polygon_metric_table(coords, num_vertices=num_vertices)
     generated_summary = summarize_polygon_dataset(coords, num_vertices=num_vertices)
     reference_summary, reference_path, reference_source = resolve_reference_summary(checkpoint, options)
     delta_vs_reference = (
         None if reference_summary is None else compare_polygon_summaries(reference_summary, generated_summary)
     )
+    reference_dataset = None
+    reference_table = None
+    if reference_path is not None and reference_path.exists():
+        reference_dataset = load_polygon_dataset(reference_path)
+        reference_table = polygon_metric_table(reference_dataset)
+    distribution_distances = (
+        None if reference_table is None else compare_polygon_metric_tables(reference_table, generated_table)
+    )
+    score_thresholds = metric_threshold_rates(
+        generated_table["score"].to_numpy(dtype=np.float64, copy=False),
+        metric_name="score",
+        thresholds=DEFAULT_SCORE_THRESHOLDS,
+    )
+    representative_indices = None
+    outlier_indices = None
+    if reference_dataset is not None:
+        representative_indices = representative_polygon_indices(
+            reference_dataset,
+            coords,
+            count=min(16, int(generated_table.shape[0])),
+            observed_num_vertices=num_vertices,
+        ).tolist()
+        outlier_indices = outlier_polygon_indices(
+            reference_dataset,
+            coords,
+            count=min(16, int(generated_table.shape[0])),
+            observed_num_vertices=num_vertices,
+        ).tolist()
 
     diagnostics_out_path = options.out_path or default_diagnostics_out_path(samples_out_path)
+    metrics_out_path = default_metrics_out_path(samples_out_path)
+    metrics_out_path.parent.mkdir(parents=True, exist_ok=True)
+    generated_table.to_csv(metrics_out_path, index=False)
     payload = {
         "config_path": str(config_path),
         "checkpoint_path": str(checkpoint_path),
@@ -637,12 +723,17 @@ def write_sampling_diagnostics(
         "run_name": checkpoint.get("run_name"),
         "sample_run_name": sample_run_name,
         "samples_path": str(samples_out_path),
+        "metrics_path": str(metrics_out_path),
         "sampling_n_steps": int(sampling_n_steps),
         "generated_summary": generated_summary,
+        "score_threshold_rates": score_thresholds,
         "reference_summary": reference_summary,
         "reference_data_path": None if reference_path is None else str(reference_path),
         "reference_summary_source": reference_source,
         "delta_vs_reference": delta_vs_reference,
+        "distribution_distances": distribution_distances,
+        "representative_polygon_indices": representative_indices,
+        "outlier_polygon_indices": outlier_indices,
     }
     if restoration is not None:
         payload["restoration_config"] = restoration.to_dict()
@@ -663,8 +754,13 @@ def write_sampling_diagnostics(
         print(f"[sample] generated vs reference: {format_polygon_delta_summary(delta_vs_reference)}")
     else:
         print("[sample] no reference summary available for direct comparison")
+    if distribution_distances is not None:
+        shift_value = distribution_distances.get("distribution_shift_mean_normalized_w1")
+        if shift_value is not None:
+            print(f"[sample] distribution shift: mean_normalized_w1={float(shift_value):.4f}")
     restoration_summary = payload.get("restoration_summary")
     if isinstance(restoration_summary, dict):
         print(f"[sample] restoration summary: {format_restoration_summary(restoration_summary)}")
+    print(f"[sample] saved metrics {metrics_out_path}")
     print(f"[sample] saved diagnostics {diagnostics_out_path}")
     return diagnostics_out_path
