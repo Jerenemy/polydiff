@@ -13,8 +13,8 @@ The code is organized so data generation, model selection, training, sampling, a
 - `polydiff/`: importable package code
 - `configs/`: YAML configs for training and sampling
 - `scripts/`: CLI wrappers
-- `data/`: raw datasets and generated samples
-- `models/`: local checkpoints and logs
+- `data/`: raw datasets and generated samples, organized per run under `data/processed/run_*`
+- `models/`: local checkpoints, logs, and config snapshots, organized per run under `models/run_*`
 - `pretrained_models/`: externally trained checkpoints
 - `notebooks/`: exploratory analysis
 - `tests/`: pytest tests
@@ -97,9 +97,12 @@ model:
 
 Training writes:
 
-- `models/train.log`: human-readable logs
-- `models/train_metrics.jsonl`: structured per-step metrics
-- `models/diffusion_final.pt`: final checkpoint
+- `models/run_####__.../train.log`: human-readable logs
+- `models/run_####__.../train_metrics.jsonl`: structured per-step metrics
+- `models/run_####__.../config.source.yaml`: original config snapshot
+- `models/run_####__.../config.resolved.yaml`: resolved config actually used
+- `models/run_####__.../run_metadata.json`: run metadata including linked output folders
+- `models/run_####__.../diffusion_final.pt`: final checkpoint
 
 Checkpoints store:
 
@@ -107,8 +110,11 @@ Checkpoints store:
 - diffusion schedule
 - `model_cfg`
 - `n_vertices`
+- `run_name`
 - training data path
 - training data summary statistics
+
+Each training invocation creates a new numbered run directory. The suffix is generated from the experiment name, model type, and dataset stem, so runs stay sortable but still human-readable.
 
 That means sampling rebuilds the same denoiser architecture from the checkpoint automatically. You do not have to restate `model.type` in `configs/sample_diffusion.yaml`; the checkpoint drives reconstruction.
 
@@ -137,17 +143,29 @@ Relevant files:
 python -m polydiff.sampling.sample --config configs/sample_diffusion.yaml
 ```
 
-The sampling config points to a checkpoint:
+By default, sampling uses the most recent `models/run_*` directory. You can override that with:
+
+```bash
+python -m polydiff.sampling.sample --run 7
+python -m polydiff.sampling.sample --run run_0007__polydiff-train-gat-hexagons-noisy
+```
+
+The sampling config can still point to an explicit checkpoint or run if needed:
 
 ```yaml
 model:
-  checkpoint: "models/diffusion_final.pt"
+  # checkpoint: "models/run_0007__.../diffusion_final.pt"
+  # run: "run_0007__..."
 ```
 
-Sampling writes:
+Sampling writes into a numbered sampling subfolder under the model run:
 
-- `data/processed/samples.npz`
-- `data/processed/samples.diagnostics.json` by default
+- `data/processed/run_####__.../sample_0001__.../samples.npz`
+- `data/processed/run_####__.../sample_0001__.../samples.diagnostics.json`
+- `data/processed/run_####__.../sample_0001__.../media/animations/sample_0000.gif` and friends when animation export is enabled
+- `data/processed/run_####__.../sample_0001__.../media/notebooks/compare_polygon_distributions/*.png` for saved notebook comparison figures
+
+If you sample from the same model run multiple times, each invocation gets a new `sample_####__...` directory. That keeps unguided, guided, and parameter-sweep sampling outputs from overwriting each other.
 
 The diagnostics JSON compares generated samples against the training reference distribution when that reference is available from the checkpoint or explicitly configured.
 

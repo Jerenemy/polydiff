@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from .. import paths
 from ..data.diagnostics import summarize_polygon_dataset
 from ..models.diffusion import Diffusion, DiffusionConfig, build_denoiser
+from ..runs import create_run_paths, write_run_files
 from ..utils.runtime import device_from_config, load_yaml_config, resolve_project_path, set_seed
 from .runtime import (
     grad_norm,
@@ -65,11 +66,73 @@ def train_from_config(config_path: Path) -> None:
 
     train_cfg = cfg.get("training", {})
     train_options = resolve_training_options(train_cfg, batch_size=batch_size)
-    save_dir = paths.ensure_dir(resolve_project_path(train_options.save_dir))
+    run_paths = create_run_paths(
+        experiment_name=str(cfg.get("experiment_name", "polydiff-train")),
+        model_type=str(model_cfg.get("type", "gat")),
+        data_path=data_path,
+        model_root=resolve_project_path(train_options.save_dir),
+    )
+    save_dir = run_paths.model_dir
 
     logger, log_path, metrics_path = setup_train_logger(save_dir)
+    resolved_cfg = {
+        **cfg,
+        "experiment_name": str(cfg.get("experiment_name", "polydiff-train")),
+        "seed": seed,
+        "device": str(device),
+        "data": {
+            "path": str(data_path),
+            "batch_size": batch_size,
+            "shuffle": shuffle,
+            "num_workers": num_workers,
+        },
+        "model": model_cfg,
+        "diffusion": {
+            "n_steps": diffusion_config.n_steps,
+            "beta_start": diffusion_config.beta_start,
+            "beta_end": diffusion_config.beta_end,
+        },
+        "training": {
+            **train_cfg,
+            "epochs": train_options.epochs,
+            "lr": train_options.lr,
+            "log_every": train_options.log_every,
+            "save_every": train_options.save_every,
+            "save_dir": str(resolve_project_path(train_options.save_dir)),
+            "sample_diagnostics_every": train_options.sample_diagnostics_every,
+            "sample_diagnostics_num_samples": train_options.sample_diagnostics_num_samples,
+            "sample_diagnostics_n_steps": train_options.sample_diagnostics_n_steps,
+            "sample_diagnostics_seed": train_options.sample_diagnostics_seed,
+        },
+        "run_name": run_paths.run_name,
+    }
+    write_run_files(
+        run_paths,
+        config=resolved_cfg,
+        config_path=config_path,
+        extra_metadata={
+            "seed": seed,
+            "data_path": str(data_path),
+            "model_cfg": model_cfg,
+            "diffusion_cfg": {
+                "n_steps": diffusion_config.n_steps,
+                "beta_start": diffusion_config.beta_start,
+                "beta_end": diffusion_config.beta_end,
+            },
+            "training_cfg": train_cfg,
+        },
+    )
     reference_summary = summarize_polygon_dataset(coords)
     optimizer = torch.optim.Adam(model.parameters(), lr=train_options.lr)
+
+    log_both_info(
+        logger,
+        "[train] run=%s model_dir=%s processed_dir=%s media_dir=%s",
+        run_paths.run_name,
+        run_paths.model_dir,
+        run_paths.processed_dir,
+        run_paths.media_dir,
+    )
 
     log_training_start(
         logger=logger,
@@ -164,6 +227,7 @@ def train_from_config(config_path: Path) -> None:
                     model_cfg=model_cfg,
                     n_vertices=n_vertices,
                     global_step=global_step,
+                    run_name=run_paths.run_name,
                     training_data_path=data_path,
                     training_data_summary=reference_summary,
                     config_path=config_path,
@@ -180,6 +244,7 @@ def train_from_config(config_path: Path) -> None:
         model_cfg=model_cfg,
         n_vertices=n_vertices,
         global_step=global_step,
+        run_name=run_paths.run_name,
         training_data_path=data_path,
         training_data_summary=reference_summary,
         config_path=config_path,

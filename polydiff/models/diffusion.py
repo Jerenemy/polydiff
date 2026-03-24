@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -506,23 +506,27 @@ class Diffusion:
         shape: tuple[int, int],
         *,
         steps: int,
-        trajectory_index: Optional[int] = None,
+        trajectory_indices: Sequence[int] | None = None,
         guidance_grad: GuidanceGradFn | None = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if trajectory_index is not None and not 0 <= trajectory_index < shape[0]:
-            raise ValueError(f"trajectory_index must be in [0, {shape[0] - 1}], got {trajectory_index}")
+        tracked_indices: list[int] | None = None
+        if trajectory_indices is not None:
+            tracked_indices = [int(idx) for idx in trajectory_indices]
+            for idx in tracked_indices:
+                if not 0 <= idx < shape[0]:
+                    raise ValueError(f"trajectory index must be in [0, {shape[0] - 1}], got {idx}")
 
         self.model.eval()
         with torch.no_grad():
             x = torch.randn(shape, device=self.device)      # initialize x_T as standard Gaussian noise
             trajectory = None
-            if trajectory_index is not None:
-                trajectory = [x[trajectory_index].detach().cpu().clone()]
+            if tracked_indices is not None:
+                trajectory = [x[tracked_indices].detach().cpu().clone()]
             for step in reversed(range(steps)):             # iterate t = steps-1, ..., 0
                 t = torch.full((shape[0],), step, device=self.device, dtype=torch.long) # batch of identical t
                 x = self.p_sample(x, t, guidance_grad=guidance_grad) # sample x_{t-1} from x_t
                 if trajectory is not None:
-                    trajectory.append(x[trajectory_index].detach().cpu().clone())
+                    trajectory.append(x[tracked_indices].detach().cpu().clone())
 
         if trajectory is None:
             return x, None
@@ -550,15 +554,30 @@ class Diffusion:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Generate samples and record one sample's denoising trajectory."""
         steps = self._resolve_n_steps(n_steps)
-        x, trajectory = self._sample_loop(
-            shape,
-            steps=steps,
-            trajectory_index=trajectory_index,
-            guidance_grad=guidance_grad,
-        )
+        x, trajectory = self._sample_loop(shape, steps=steps, trajectory_indices=[trajectory_index], guidance_grad=guidance_grad)
         if trajectory is None:
             raise RuntimeError("trajectory capture unexpectedly returned no trajectory")
-        return x, trajectory
+        return x, trajectory[:, 0, :]
+
+    def p_sample_loop_trajectories(
+        self,
+        shape: tuple[int, int],
+        *,
+        n_steps: Optional[int] = None,
+        trajectory_indices: Sequence[int],
+        guidance_grad: GuidanceGradFn | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Generate samples and record several samples' denoising trajectories."""
+        steps = self._resolve_n_steps(n_steps)
+        x, trajectories = self._sample_loop(
+            shape,
+            steps=steps,
+            trajectory_indices=trajectory_indices,
+            guidance_grad=guidance_grad,
+        )
+        if trajectories is None:
+            raise RuntimeError("trajectory capture unexpectedly returned no trajectories")
+        return x, trajectories
 
     def loss(self, x0: torch.Tensor, *, return_stats: bool = False) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
         """Training loss: predict the noise used to create x_t from x_0."""

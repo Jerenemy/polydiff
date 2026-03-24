@@ -20,13 +20,15 @@ from ..data.diagnostics import (
 from ..models.diffusion import Diffusion, DiffusionConfig, build_denoiser
 from ..utils.runtime import resolve_project_path
 
-DEFAULT_ANIMATION_OUT_PATH = "data/processed/sample_trajectory.gif"
+DEFAULT_SAMPLES_OUT_NAME = "samples.npz"
+DEFAULT_ANIMATION_DIR_NAME = "animations"
 
 
 @dataclass(frozen=True, slots=True)
 class AnimationOptions:
     out_path: Path
     sample_index: int
+    count: int
     max_frames: int
     fps: int
 
@@ -86,18 +88,31 @@ def load_diffusion_from_checkpoint(
 
 def normalize_animation_out_path(path_like: str | Path) -> Path:
     out_path = resolve_project_path(path_like)
-    if out_path.suffix == "":
-        out_path = out_path.with_suffix(".gif")
-    if out_path.suffix.lower() != ".gif":
-        raise ValueError(f"animation output must be a .gif file, got {out_path}")
+    if out_path.suffix and out_path.suffix.lower() != ".gif":
+        raise ValueError(f"animation output must be a .gif file or directory, got {out_path}")
     return out_path
+
+
+def animation_sample_indices(options: AnimationOptions) -> list[int]:
+    return list(range(options.sample_index, options.sample_index + options.count))
+
+
+def animation_output_paths(options: AnimationOptions) -> list[Path]:
+    sample_indices = animation_sample_indices(options)
+    if options.count == 1 and options.out_path.suffix.lower() == ".gif":
+        return [options.out_path]
+
+    out_dir = options.out_path if options.out_path.suffix == "" else options.out_path.parent / options.out_path.stem
+    return [out_dir / f"sample_{sample_index:04d}.gif" for sample_index in sample_indices]
 
 
 def resolve_animation_options(
     sampling_cfg: dict[str, Any],
     *,
     enable_animation: bool,
+    default_out_path: Path | None,
     animation_out_path: str | None,
+    animation_count: int | None,
     animation_sample_index: int | None,
     animation_max_frames: int | None,
     animation_fps: int | None,
@@ -109,8 +124,9 @@ def resolve_animation_options(
         raise ValueError("sampling.animation must be a mapping if provided")
 
     out_path = animation_cfg.get("out_path")
+    count = animation_cfg.get("count", 1)
     if enable_animation:
-        out_path = animation_out_path or out_path or DEFAULT_ANIMATION_OUT_PATH
+        out_path = animation_out_path or out_path or default_out_path or DEFAULT_ANIMATION_DIR_NAME
 
     if out_path is None:
         return None
@@ -119,6 +135,8 @@ def resolve_animation_options(
     max_frames = animation_cfg.get("max_frames", 120)
     fps = animation_cfg.get("fps", 12)
 
+    if animation_count is not None:
+        count = animation_count
     if animation_sample_index is not None:
         sample_index = animation_sample_index
     if animation_max_frames is not None:
@@ -127,11 +145,14 @@ def resolve_animation_options(
         fps = animation_fps
 
     sample_index = int(sample_index)
+    count = int(count)
     max_frames = int(max_frames)
     fps = int(fps)
 
     if sample_index < 0:
         raise ValueError(f"animation sample_index must be >= 0, got {sample_index}")
+    if count < 1:
+        raise ValueError(f"animation count must be at least 1, got {count}")
     if max_frames < 2:
         raise ValueError(f"animation max_frames must be at least 2, got {max_frames}")
     if fps < 1:
@@ -140,6 +161,7 @@ def resolve_animation_options(
     return AnimationOptions(
         out_path=normalize_animation_out_path(out_path),
         sample_index=sample_index,
+        count=count,
         max_frames=max_frames,
         fps=fps,
     )
@@ -220,8 +242,11 @@ def resolve_sampling_request(
     sampling_cfg: dict[str, Any],
     *,
     checkpoint_n_steps: int,
+    default_out_path: Path | None,
+    default_animation_out_path: Path | None,
     enable_animation: bool,
     animation_out_path: str | None,
+    animation_count: int | None,
     animation_sample_index: int | None,
     animation_max_frames: int | None,
     animation_fps: int | None,
@@ -243,7 +268,9 @@ def resolve_sampling_request(
     animation = resolve_animation_options(
         sampling_cfg,
         enable_animation=enable_animation,
+        default_out_path=default_animation_out_path,
         animation_out_path=animation_out_path,
+        animation_count=animation_count,
         animation_sample_index=animation_sample_index,
         animation_max_frames=animation_max_frames,
         animation_fps=animation_fps,
@@ -253,8 +280,17 @@ def resolve_sampling_request(
             f"animation sample_index must be in [0, {num_samples - 1}] for num_samples={num_samples}, "
             f"got {animation.sample_index}"
         )
+    if animation is not None and animation.sample_index + animation.count > num_samples:
+        raise ValueError(
+            f"animation sample_index + count must be <= num_samples ({num_samples}), "
+            f"got start={animation.sample_index}, count={animation.count}"
+        )
 
-    out_path = resolve_project_path(sampling_cfg.get("out_path", "data/processed/samples.npz"))
+    out_path_value = sampling_cfg.get("out_path")
+    if out_path_value is None:
+        out_path = default_out_path or resolve_project_path(f"data/processed/{DEFAULT_SAMPLES_OUT_NAME}")
+    else:
+        out_path = resolve_project_path(out_path_value)
     return SamplingRequest(
         num_samples=num_samples,
         n_steps=n_steps,
@@ -275,6 +311,34 @@ def save_animation(trajectory: torch.Tensor, n_vertices: int, options: Animation
         fps=options.fps,
         max_frames=options.max_frames,
     )
+
+
+def save_animations(trajectories: torch.Tensor, n_vertices: int, options: AnimationOptions) -> list[Path]:
+    from ..data.plot_polygons import save_polygon_animation
+
+    output_paths = animation_output_paths(options)
+    trajectories_cpu = trajectories.detach().cpu()
+    if trajectories_cpu.ndim == 2:
+        trajectories_cpu = trajectories_cpu.unsqueeze(1)
+    if trajectories_cpu.ndim != 3:
+        raise ValueError(f"trajectories must have shape (frames, count, data_dim), got {tuple(trajectories_cpu.shape)}")
+    if trajectories_cpu.shape[1] != len(output_paths):
+        raise ValueError(
+            f"expected {len(output_paths)} trajectories for animation save, got {trajectories_cpu.shape[1]}"
+        )
+
+    saved_paths: list[Path] = []
+    for i, out_path in enumerate(output_paths):
+        coords = trajectories_cpu[:, i, :].numpy().reshape(trajectories_cpu.shape[0], n_vertices, 2).astype(np.float32)
+        saved_paths.append(
+            save_polygon_animation(
+                coords,
+                out_path,
+                fps=options.fps,
+                max_frames=options.max_frames,
+            )
+        )
+    return saved_paths
 
 
 def default_diagnostics_out_path(samples_out_path: Path) -> Path:
@@ -315,6 +379,7 @@ def write_sampling_diagnostics(
     coords: np.ndarray,
     options: DiagnosticsOptions,
     sampling_n_steps: int,
+    sample_run_name: str | None = None,
 ) -> Path | None:
     if not options.enabled:
         return None
@@ -330,6 +395,8 @@ def write_sampling_diagnostics(
         "config_path": str(config_path),
         "checkpoint_path": str(checkpoint_path),
         "checkpoint_step": checkpoint.get("global_step"),
+        "run_name": checkpoint.get("run_name"),
+        "sample_run_name": sample_run_name,
         "samples_path": str(samples_out_path),
         "sampling_n_steps": int(sampling_n_steps),
         "generated_summary": generated_summary,

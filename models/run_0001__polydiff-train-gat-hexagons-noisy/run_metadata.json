@@ -1,0 +1,35 @@
+{
+  "config_path": "/Users/jeremyzay/Desktop/thayer_lab_research/2026/spring_2026/polydiff/configs/train_diffusion.yaml",
+  "created_at": "2026-03-23T17:27:01.714056-04:00",
+  "data_path": "/Users/jeremyzay/Desktop/thayer_lab_research/2026/spring_2026/polydiff/data/raw/hexagons_noisy.npz",
+  "diffusion_cfg": {
+    "beta_end": 0.02,
+    "beta_start": 0.0001,
+    "n_steps": 30
+  },
+  "media_dir": "/Users/jeremyzay/Desktop/thayer_lab_research/2026/spring_2026/polydiff/data/processed/run_0001__polydiff-train-gat-hexagons-noisy/media",
+  "model_cfg": {
+    "hidden_dim": 256,
+    "num_layers": 3,
+    "time_emb_dim": 64,
+    "type": "gat",
+    "use_global_features": true
+  },
+  "model_dir": "/Users/jeremyzay/Desktop/thayer_lab_research/2026/spring_2026/polydiff/models/run_0001__polydiff-train-gat-hexagons-noisy",
+  "processed_dir": "/Users/jeremyzay/Desktop/thayer_lab_research/2026/spring_2026/polydiff/data/processed/run_0001__polydiff-train-gat-hexagons-noisy",
+  "resolved_config_path": "/Users/jeremyzay/Desktop/thayer_lab_research/2026/spring_2026/polydiff/models/run_0001__polydiff-train-gat-hexagons-noisy/config.resolved.yaml",
+  "run_name": "run_0001__polydiff-train-gat-hexagons-noisy",
+  "run_number": 1,
+  "seed": 0,
+  "source_config_path": "/Users/jeremyzay/Desktop/thayer_lab_research/2026/spring_2026/polydiff/models/run_0001__polydiff-train-gat-hexagons-noisy/config.source.yaml",
+  "training_cfg": {
+    "epochs": 40,
+    "log_every": 50,
+    "lr": 0.0002,
+    "sample_diagnostics_every": 0,
+    "sample_diagnostics_num_samples": 128,
+    "sample_diagnostics_seed": 0,
+    "save_dir": "models",
+    "save_every": 2000
+  }
+}
