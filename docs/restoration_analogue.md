@@ -204,6 +204,32 @@ That is why the model can still use the same generic sampler interface as regula
 
 In the current sampler, restoration guidance is also weighted by reverse-diffusion timestep. Early noisy steps get only a small fraction of the configured restoration strength, and late steps get the full strength. This keeps the restoration proxy from overreacting to raw Gaussian noise at the start of sampling.
 
+## How The Landscape Was Stabilized
+
+Early versions of the restoration proxy were differentiable, but still too sharp in practice. The main problem was not autograd failure. The problem was that the landscape behaved too much like a hard winner-take-all system in some regions.
+
+The biggest sources of instability were:
+
+- `contact_beta` too high, which made the contact softmax almost one-hot and let the dominant contact vertex switch abruptly
+- `activation_sigma` too small, which made the restoration score collapse quickly once contact drift increased
+- `dna_binding_steepness` too high, which made DNA activation behave almost like a hard threshold
+
+The current stabilization strategy is:
+
+- make restoration guidance timestep-aware so it is weak on very noisy early states
+- reduce `contact_beta` so the contact distribution is less switchy
+- increase `activation_sigma` so the restored state has a broader basin
+- reduce `dna_binding_steepness` so downstream DNA activation changes more gradually
+- optionally pair restoration with `regularity` guidance so stretched or degenerate polygons are less attractive
+
+In the current example config, the landscape is intentionally softened with:
+
+- `contact_beta = 7.0`
+- `activation_sigma = 0.50`
+- `dna_binding_steepness = 8.0`
+
+These choices do not make the landscape perfectly smooth, but they reduce abrupt cliff-like transitions and make the reverse trajectory much easier to interpret.
+
 ## Why Regularity Is Still Useful
 
 Restoration guidance only says:

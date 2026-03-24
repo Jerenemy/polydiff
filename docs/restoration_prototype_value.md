@@ -108,8 +108,17 @@ That discovery led directly to a better design:
 - its effective strength ramps up over reverse diffusion
 - early noisy steps are treated cautiously
 - late near-denoised steps receive the strongest restoration pressure
+- the proxy itself was softened by lowering `contact_beta`, raising `activation_sigma`, and lowering `dna_binding_steepness`
 
 This is exactly the kind of design correction a prototype is supposed to reveal. It would have been much harder to infer only from theory.
+
+Just as important, later debugging showed that the main instability was not "non-differentiability" in the strict sense. It was a locally stiff landscape:
+
+- the contact softmax could become almost winner-take-all
+- the effective contact vertex could change abruptly
+- the restoration score and DNA activation could then fall off too quickly
+
+That is a valuable prototype result in its own right. It told us which parts of the proxy needed smoothing and why.
 
 ## Validity And Restoration Are Competing Objectives
 

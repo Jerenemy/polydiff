@@ -449,6 +449,8 @@ The proxy uses a differentiable soft contact point on the polygon boundary relat
 
 Restoration guidance is also timestep-aware during sampling: its effective strength is ramped up over reverse diffusion so very noisy early states are not pushed as aggressively as late near-denoised states.
 
+To keep the restoration landscape from becoming too cliff-like, the example config also uses a softer contact temperature (`contact_beta`), a broader restoration basin (`activation_sigma`), and a less abrupt DNA activation (`dna_binding_steepness`).
+
 This entire path is opt-in. If `sampling.restoration` is absent or `enabled: false`, the previous sampling and diagnostics behavior stays unchanged.
 
 Relevant code:
@@ -525,8 +527,10 @@ sampling:
     ligand_binding_site: [1.00, 0.02]
     dna_unbound_position: [1.95, 0.15]
     dna_bound_position: [0.05, 0.15]
+    activation_sigma: 0.50
+    contact_beta: 7.0
     dna_binding_threshold: 0.68
-    dna_binding_steepness: 16.0
+    dna_binding_steepness: 8.0
 ```
 
 Important toggle behavior:
