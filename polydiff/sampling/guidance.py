@@ -12,6 +12,11 @@ import torch.nn.functional as F
 from ..data.polygon_dataset import PolygonGraphBatch
 from ..models.guidance_models import build_guidance_model
 from ..models.regularity_torch import regularity_score_torch, smooth_polygon_area_torch
+from ..restoration import (
+    RestorationProxyConfig,
+    restoration_state_torch_dense,
+    restoration_state_torch_graph,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,7 +193,100 @@ class AreaGuidance:
         return self.scale * grad.detach()
 
 
-SamplingGuidance = ClassifierGuidance | RegressorGuidance | RegularityScoreGuidance | AreaGuidance
+@dataclass(frozen=True, slots=True)
+class RestorationGuidance:
+    n_vertices: int | None
+    scale: float
+    restoration: RestorationProxyConfig
+    target_value: float | None = None
+    num_steps: int = 1
+    min_timestep_weight: float = 0.05
+    timestep_power: float = 2.0
+
+    def __call__(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        *,
+        graph_batch: PolygonGraphBatch | None = None,
+    ) -> torch.Tensor:
+        with torch.enable_grad():
+            x_in = x_t.detach().requires_grad_(True)
+            if graph_batch is None:
+                if self.n_vertices is None:
+                    raise ValueError("n_vertices is required for dense analytic restoration guidance")
+                if x_in.ndim != 2 or x_in.shape[1] != self.n_vertices * 2:
+                    raise ValueError(
+                        f"x_t must have shape (batch, {self.n_vertices * 2}) for n_vertices={self.n_vertices}, "
+                        f"got {tuple(x_in.shape)}"
+                    )
+                state = restoration_state_torch_dense(
+                    x_in.reshape(x_in.shape[0], self.n_vertices, 2),
+                    self.restoration,
+                )
+            else:
+                state = restoration_state_torch_graph(x_in, graph_batch, self.restoration)
+
+            timestep_weight = _restoration_timestep_weight(
+                t,
+                num_steps=self.num_steps,
+                min_timestep_weight=self.min_timestep_weight,
+                timestep_power=self.timestep_power,
+                dtype=state.dna_distance.dtype,
+            )
+            dna_distance = state.dna_distance
+            if self.target_value is None:
+                objective = -(timestep_weight * dna_distance.square()).sum()
+            else:
+                objective = -(timestep_weight * ((dna_distance - float(self.target_value)) ** 2)).sum()
+            grad = torch.autograd.grad(objective, x_in)[0]
+        return self.scale * grad.detach()
+
+
+AtomicSamplingGuidance = (
+    ClassifierGuidance
+    | RegressorGuidance
+    | RegularityScoreGuidance
+    | AreaGuidance
+    | RestorationGuidance
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CompositeGuidance:
+    components: tuple[AtomicSamplingGuidance, ...]
+
+    def __call__(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        *,
+        graph_batch: PolygonGraphBatch | None = None,
+    ) -> torch.Tensor:
+        grad_total = torch.zeros_like(x_t)
+        for component in self.components:
+            grad_total = grad_total + component(x_t, t, graph_batch=graph_batch)
+        return grad_total
+
+
+SamplingGuidance = AtomicSamplingGuidance | CompositeGuidance
+
+
+def _restoration_timestep_weight(
+    t: torch.Tensor,
+    *,
+    num_steps: int,
+    min_timestep_weight: float,
+    timestep_power: float,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if t.ndim != 1:
+        raise ValueError(f"t must have shape (batch,), got {tuple(t.shape)}")
+    if num_steps <= 1:
+        return torch.ones_like(t, dtype=dtype)
+    progress = 1.0 - t.to(dtype) / float(num_steps - 1)
+    progress = progress.clamp(0.0, 1.0)
+    return float(min_timestep_weight) + (1.0 - float(min_timestep_weight)) * progress.pow(float(timestep_power))
 
 
 def _graph_batch_dense_input(
@@ -215,12 +313,16 @@ def load_sampling_guidance(
     device: torch.device,
     kind: str,
     scale: float,
+    num_steps: int | None = None,
     n_vertices: int | None = None,
     target_class: int | None = None,
     target_value: float | None = None,
     alpha: float = 8.0,
     beta: float = 5.0,
     gamma: float = 4.0,
+    min_timestep_weight: float = 0.05,
+    timestep_power: float = 2.0,
+    restoration: RestorationProxyConfig | None = None,
 ) -> tuple[dict[str, Any], SamplingGuidance, int | None]:
     task = str(kind).lower()
 
@@ -255,6 +357,31 @@ def load_sampling_guidance(
             scale=float(scale),
             target_value=None if target_value is None else float(target_value),
             absolute=True,
+        )
+        return metadata, guidance, None if n_vertices is None else int(n_vertices)
+
+    if task == "restoration":
+        if restoration is None:
+            raise ValueError("restoration config is required for restoration guidance")
+        if num_steps is None:
+            raise ValueError("num_steps is required for restoration guidance")
+        metadata = {
+            "guidance_task": "restoration",
+            "restoration": restoration.to_dict(),
+            "guidance_num_steps": int(num_steps),
+            "min_timestep_weight": float(min_timestep_weight),
+            "timestep_power": float(timestep_power),
+        }
+        if n_vertices is not None:
+            metadata["n_vertices"] = int(n_vertices)
+        guidance = RestorationGuidance(
+            n_vertices=None if n_vertices is None else int(n_vertices),
+            scale=float(scale),
+            restoration=restoration,
+            target_value=None if target_value is None else float(target_value),
+            num_steps=int(num_steps),
+            min_timestep_weight=float(min_timestep_weight),
+            timestep_power=float(timestep_power),
         )
         return metadata, guidance, None if n_vertices is None else int(n_vertices)
 
@@ -306,7 +433,9 @@ def load_sampling_guidance(
         )
         return checkpoint, guidance, n_vertices
 
-    raise ValueError(f"Unsupported guidance kind {kind!r}; expected one of: classifier, regressor, regularity, area")
+    raise ValueError(
+        f"Unsupported guidance kind {kind!r}; expected one of: classifier, regressor, regularity, area, restoration"
+    )
 
 
 def load_guidance_from_checkpoint(

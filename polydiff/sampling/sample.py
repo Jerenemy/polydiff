@@ -18,10 +18,12 @@ from ..runs import (
     write_sampling_run_files,
 )
 from ..utils.runtime import device_from_config, load_yaml_config, resolve_project_path, set_seed
-from .guidance import load_sampling_guidance
+from ..restoration import RestorationTrajectoryRecorder
+from .guidance import CompositeGuidance, load_sampling_guidance
 from .runtime import (
     DEFAULT_ANIMATION_DIR_NAME,
     DEFAULT_SAMPLES_OUT_NAME,
+    GuidanceOptions,
     animation_sample_indices,
     load_diffusion_from_checkpoint,
     resolve_sampling_request,
@@ -45,7 +47,18 @@ def build_sampling_run_label(cfg: dict[str, object], sampling_cfg: dict[str, obj
     parts = [str(cfg.get("experiment_name", "polydiff-sample"))]
     guidance_cfg = sampling_cfg.get("guidance")
     if isinstance(guidance_cfg, dict) and bool(guidance_cfg.get("enabled", False)):
-        parts.append(str(guidance_cfg.get("kind", "classifier")).lower())
+        components_cfg = guidance_cfg.get("components")
+        if isinstance(components_cfg, list):
+            kinds = [
+                str(component_cfg.get("kind", "")).lower()
+                for component_cfg in components_cfg
+                if isinstance(component_cfg, dict) and bool(component_cfg.get("enabled", True))
+            ]
+            kinds = list(dict.fromkeys(kind for kind in kinds if kind))
+            if kinds:
+                parts.append("-".join(kinds))
+        else:
+            parts.append(str(guidance_cfg.get("kind", "classifier")).lower())
         parts.append("guided")
     else:
         parts.append("unguided")
@@ -137,6 +150,21 @@ def _resolve_sample_num_vertices(
     return rng.choice(values, size=request_num_samples, replace=True, p=probabilities).astype(np.int32)
 
 
+def _resolved_guidance_config(guidance: GuidanceOptions) -> dict[str, object]:
+    if not guidance.enabled:
+        return {"enabled": False}
+    if len(guidance.components) == 1:
+        component = guidance.components[0]
+        return {
+            "enabled": True,
+            **component.to_config_dict(),
+        }
+    return {
+        "enabled": True,
+        "components": [component.to_config_dict() for component in guidance.components],
+    }
+
+
 def sample_from_config(config_path: Path, *, cli_overrides: SampleCliOverrides | None = None) -> None:
     cli_overrides = cli_overrides or SampleCliOverrides()
     cfg = load_yaml_config(config_path)
@@ -188,6 +216,7 @@ def sample_from_config(config_path: Path, *, cli_overrides: SampleCliOverrides |
         animation_max_frames=cli_overrides.animation_max_frames,
         animation_fps=cli_overrides.animation_fps,
     )
+    restoration_recorder = None if request.restoration is None else RestorationTrajectoryRecorder(request.restoration)
     request.out_path.parent.mkdir(parents=True, exist_ok=True)
     if sample_run_paths is not None:
         resolved_cfg = {
@@ -203,6 +232,7 @@ def sample_from_config(config_path: Path, *, cli_overrides: SampleCliOverrides |
                 "num_samples": request.num_samples,
                 "n_steps": request.n_steps,
                 "out_path": str(request.out_path),
+                "guidance": _resolved_guidance_config(request.guidance),
                 "diagnostics": {
                     **(sampling_cfg.get("diagnostics") or {}),
                     "enabled": request.diagnostics.enabled,
@@ -231,6 +261,11 @@ def sample_from_config(config_path: Path, *, cli_overrides: SampleCliOverrides |
                 "max_frames": request.animation.max_frames,
                 "fps": request.animation.fps,
             }
+        if request.restoration is not None:
+            resolved_cfg["sampling"]["restoration"] = {
+                "enabled": True,
+                **request.restoration.to_dict(),
+            }
         write_sampling_run_files(
             sample_run_paths,
             config=resolved_cfg,
@@ -252,56 +287,63 @@ def sample_from_config(config_path: Path, *, cli_overrides: SampleCliOverrides |
     )
     uniform_sample_size = int(sample_num_vertices[0]) if np.all(sample_num_vertices == sample_num_vertices[0]) else None
 
-    guidance_grad = None
+    guidance_terms = []
     if request.guidance.enabled:
-        if (
-            model_type != "mlp"
-            and request.guidance.kind in {"classifier", "regressor"}
-            and uniform_sample_size is None
-        ):
-            raise ValueError(
-                "checkpoint-backed classifier/regressor guidance requires a uniform polygon size batch; "
-                "use sampling.size_distribution with one size or switch to analytic guidance"
+        descriptions: list[str] = []
+        for component in request.guidance.components:
+            if model_type != "mlp" and component.kind in {"classifier", "regressor"} and uniform_sample_size is None:
+                raise ValueError(
+                    "checkpoint-backed classifier/regressor guidance requires a uniform polygon size batch; "
+                    "use sampling.size_distribution with one size or switch to analytic guidance"
+                )
+            _, guidance, guidance_n_vertices = load_sampling_guidance(
+                component.checkpoint_path,
+                device=device,
+                kind=component.kind,
+                scale=component.scale,
+                num_steps=request.n_steps,
+                n_vertices=uniform_sample_size,
+                target_class=component.target_class,
+                target_value=component.target_value,
+                alpha=component.alpha,
+                beta=component.beta,
+                gamma=component.gamma,
+                min_timestep_weight=component.min_timestep_weight,
+                timestep_power=component.timestep_power,
+                restoration=request.restoration,
             )
-        _, guidance, guidance_n_vertices = load_sampling_guidance(
-            request.guidance.checkpoint_path,
-            device=device,
-            kind=request.guidance.kind or "classifier",
-            scale=request.guidance.scale,
-            n_vertices=uniform_sample_size,
-            target_class=request.guidance.target_class,
-            target_value=request.guidance.target_value,
-            alpha=request.guidance.alpha,
-            beta=request.guidance.beta,
-            gamma=request.guidance.gamma,
-        )
-        if model_type == "mlp" and guidance_n_vertices != int(sample_num_vertices[0]):
-            raise ValueError(
-                f"guidance model n_vertices={guidance_n_vertices} does not match "
-                f"diffusion checkpoint n_vertices={int(sample_num_vertices[0])}"
-            )
-        guidance_grad = guidance
-        guidance_desc = f"scale={request.guidance.scale}"
-        if request.guidance.kind == "regularity":
-            guidance_desc += (
-                f", analytic_score(alpha={request.guidance.alpha}, "
-                f"beta={request.guidance.beta}, gamma={request.guidance.gamma})"
-            )
-        elif request.guidance.kind == "area":
-            guidance_desc += ", analytic_area(smooth_absolute_shoelace)"
-        else:
-            guidance_desc += f", checkpoint={request.guidance.checkpoint_path}"
-        if request.guidance.kind == "classifier":
-            guidance_desc += f", target_class={request.guidance.target_class}"
-        elif request.guidance.target_value is not None:
-            guidance_desc += f", target_value={request.guidance.target_value}"
-        elif request.guidance.kind == "regularity":
-            guidance_desc += ", objective=maximize_regularity_score"
-        elif request.guidance.kind == "area":
-            guidance_desc += ", objective=maximize_area"
-        else:
-            guidance_desc += ", objective=maximize_predicted_score"
-        print(f"[sample] enabled {request.guidance.kind} guidance ({guidance_desc})")
+            if (
+                model_type == "mlp"
+                and component.kind in {"classifier", "regressor"}
+                and guidance_n_vertices != int(sample_num_vertices[0])
+            ):
+                raise ValueError(
+                    f"guidance model n_vertices={guidance_n_vertices} does not match "
+                    f"diffusion checkpoint n_vertices={int(sample_num_vertices[0])}"
+                )
+            guidance_terms.append(guidance)
+
+            description = f"{component.kind}(scale={component.scale}"
+            if component.kind == "regularity":
+                description += (
+                    f", alpha={component.alpha}, beta={component.beta}, gamma={component.gamma}"
+                )
+            elif component.kind in {"classifier", "regressor"}:
+                description += f", checkpoint={component.checkpoint_path}"
+            elif component.kind == "restoration":
+                description += (
+                    ", objective=dna_distance_after_protein_restoration"
+                    f", min_timestep_weight={component.min_timestep_weight}"
+                    f", timestep_power={component.timestep_power}"
+                )
+            if component.kind == "classifier":
+                description += f", target_class={component.target_class}"
+            elif component.target_value is not None:
+                description += f", target_value={component.target_value}"
+            description += ")"
+            descriptions.append(description)
+        print(f"[sample] enabled guidance terms: {', '.join(descriptions)}")
+    guidance_grad = None if not guidance_terms else CompositeGuidance(tuple(guidance_terms))
 
     if model_type == "mlp":
         fixed_n_vertices = int(sample_num_vertices[0])
@@ -310,6 +352,7 @@ def sample_from_config(config_path: Path, *, cli_overrides: SampleCliOverrides |
                 (request.num_samples, fixed_n_vertices * 2),
                 n_steps=request.n_steps,
                 guidance_grad=guidance_grad,
+                observer=None if restoration_recorder is None else restoration_recorder.observe,
             )
             trajectories = None
         else:
@@ -318,6 +361,7 @@ def sample_from_config(config_path: Path, *, cli_overrides: SampleCliOverrides |
                 n_steps=request.n_steps,
                 trajectory_indices=animation_sample_indices(request.animation),
                 guidance_grad=guidance_grad,
+                observer=None if restoration_recorder is None else restoration_recorder.observe,
             )
         graph_batch = None
     else:
@@ -326,6 +370,7 @@ def sample_from_config(config_path: Path, *, cli_overrides: SampleCliOverrides |
                 sample_num_vertices.tolist(),
                 n_steps=request.n_steps,
                 guidance_grad=guidance_grad,
+                observer=None if restoration_recorder is None else restoration_recorder.observe,
             )
             trajectories = None
         else:
@@ -334,6 +379,7 @@ def sample_from_config(config_path: Path, *, cli_overrides: SampleCliOverrides |
                 n_steps=request.n_steps,
                 trajectory_indices=animation_sample_indices(request.animation),
                 guidance_grad=guidance_grad,
+                observer=None if restoration_recorder is None else restoration_recorder.observe,
             )
 
     meta = dict(
@@ -386,7 +432,12 @@ def sample_from_config(config_path: Path, *, cli_overrides: SampleCliOverrides |
         f"(sampling n_steps={request.n_steps}, checkpoint n_steps={diffusion_config.n_steps})"
     )
     if trajectories is not None and request.animation is not None:
-        animation_out_paths = save_animations(trajectories, None if graph_batch is not None else n_vertices, request.animation)
+        animation_out_paths = save_animations(
+            trajectories,
+            None if graph_batch is not None else n_vertices,
+            request.animation,
+            restoration=request.restoration,
+        )
         print(
             f"[sample] saved {len(animation_out_paths)} animation(s) under {animation_out_paths[0].parent} "
             f"(start_index={request.animation.sample_index}, count={request.animation.count}, "
@@ -403,6 +454,8 @@ def sample_from_config(config_path: Path, *, cli_overrides: SampleCliOverrides |
         options=request.diagnostics,
         sampling_n_steps=request.n_steps,
         sample_run_name=None if sample_run_paths is None else sample_run_paths.sample_run_name,
+        restoration=request.restoration,
+        restoration_trajectory=None if restoration_recorder is None else restoration_recorder.to_dict(),
     )
 
 

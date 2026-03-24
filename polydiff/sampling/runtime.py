@@ -20,6 +20,13 @@ from ..data.diagnostics import (
 from ..data.gen_polygons import normalize_size_distribution
 from ..data.polygon_dataset import load_polygon_dataset
 from ..models.diffusion import Diffusion, DiffusionConfig, build_denoiser
+from ..restoration import (
+    RestorationProxyConfig,
+    build_restoration_animation_overlay,
+    format_restoration_summary,
+    restoration_scene_coords_numpy,
+    summarize_restoration_dataset,
+)
 from ..utils.runtime import resolve_project_path
 
 DEFAULT_SAMPLES_OUT_NAME = "samples.npz"
@@ -43,9 +50,8 @@ class DiagnosticsOptions:
 
 
 @dataclass(frozen=True, slots=True)
-class GuidanceOptions:
-    enabled: bool
-    kind: str | None
+class GuidanceComponentOptions:
+    kind: str
     checkpoint_path: Path | None
     scale: float
     target_class: int
@@ -53,6 +59,34 @@ class GuidanceOptions:
     alpha: float
     beta: float
     gamma: float
+    min_timestep_weight: float
+    timestep_power: float
+
+    def to_config_dict(self) -> dict[str, object]:
+        out: dict[str, object] = {
+            "kind": self.kind,
+            "scale": float(self.scale),
+        }
+        if self.checkpoint_path is not None:
+            out["checkpoint"] = str(self.checkpoint_path)
+        if self.kind == "classifier":
+            out["target_class"] = int(self.target_class)
+        elif self.target_value is not None:
+            out["target_value"] = float(self.target_value)
+        if self.kind == "regularity":
+            out["alpha"] = float(self.alpha)
+            out["beta"] = float(self.beta)
+            out["gamma"] = float(self.gamma)
+        if self.kind == "restoration":
+            out["min_timestep_weight"] = float(self.min_timestep_weight)
+            out["timestep_power"] = float(self.timestep_power)
+        return out
+
+
+@dataclass(frozen=True, slots=True)
+class GuidanceOptions:
+    enabled: bool
+    components: tuple[GuidanceComponentOptions, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +103,7 @@ class SamplingRequest:
     animation: AnimationOptions | None
     diagnostics: DiagnosticsOptions
     guidance: GuidanceOptions
+    restoration: RestorationProxyConfig | None
     size_distribution: SizeDistributionOptions | None
 
 
@@ -192,50 +227,135 @@ def resolve_diagnostics_options(sampling_cfg: dict[str, Any]) -> DiagnosticsOpti
     )
 
 
-def resolve_guidance_options(sampling_cfg: dict[str, Any]) -> GuidanceOptions:
-    guidance_cfg = sampling_cfg.get("guidance", {})
-    if guidance_cfg is None:
-        guidance_cfg = {}
-    if not isinstance(guidance_cfg, dict):
-        raise ValueError("sampling.guidance must be a mapping if provided")
+def _resolve_xy_point(value: object, *, field_name: str) -> tuple[float, float]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"{field_name} must be a length-2 sequence, got {value!r}")
+    return float(value[0]), float(value[1])
 
-    enabled = bool(guidance_cfg.get("enabled", False))
-    kind = guidance_cfg.get("kind")
-    checkpoint_path = guidance_cfg.get("checkpoint")
-    scale = float(guidance_cfg.get("scale", 1.0))
-    target_class = int(guidance_cfg.get("target_class", 1))
-    target_value_raw = guidance_cfg.get("target_value")
-    target_value = None if target_value_raw is None else float(target_value_raw)
-    alpha = float(guidance_cfg.get("alpha", 8.0))
-    beta = float(guidance_cfg.get("beta", 5.0))
-    gamma = float(guidance_cfg.get("gamma", 4.0))
 
-    if not enabled:
-        return GuidanceOptions(
-            enabled=False,
-            kind=None if kind is None else str(kind),
-            checkpoint_path=None if checkpoint_path is None else resolve_project_path(checkpoint_path),
-            scale=scale,
-            target_class=target_class,
-            target_value=target_value,
-            alpha=alpha,
-            beta=beta,
-            gamma=gamma,
+def _resolve_xy_points(value: object, *, field_name: str) -> tuple[tuple[float, float], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{field_name} must be a sequence of [x, y] points, got {value!r}")
+    return tuple(_resolve_xy_point(point, field_name=field_name) for point in value)
+
+
+def resolve_restoration_options(sampling_cfg: dict[str, Any]) -> RestorationProxyConfig | None:
+    restoration_cfg = sampling_cfg.get("restoration")
+    if restoration_cfg is None:
+        return None
+    if not isinstance(restoration_cfg, dict):
+        raise ValueError("sampling.restoration must be a mapping if provided")
+    if not bool(restoration_cfg.get("enabled", False)):
+        return None
+
+    ligand_binding_site = _resolve_xy_point(
+        restoration_cfg.get("ligand_binding_site", restoration_cfg.get("binding_site")),
+        field_name="sampling.restoration.ligand_binding_site",
+    )
+    dna_unbound_position = _resolve_xy_point(
+        restoration_cfg.get("dna_unbound_position", restoration_cfg.get("mutant_position")),
+        field_name="sampling.restoration.dna_unbound_position",
+    )
+    dna_bound_position = _resolve_xy_point(
+        restoration_cfg.get("dna_bound_position", restoration_cfg.get("wild_type_position")),
+        field_name="sampling.restoration.dna_bound_position",
+    )
+    mutant_target_points = _resolve_xy_points(
+        restoration_cfg.get("mutant_target_points", restoration_cfg.get("target_points", ())),
+        field_name="sampling.restoration.mutant_target_points",
+    )
+    if not mutant_target_points:
+        raise ValueError("sampling.restoration.mutant_target_points must contain at least one [x, y] point")
+    wild_type_target_points = restoration_cfg.get("wild_type_target_points")
+    if wild_type_target_points is not None:
+        wild_type_target_points = _resolve_xy_points(
+            wild_type_target_points,
+            field_name="sampling.restoration.wild_type_target_points",
         )
-
-    kind_str = "classifier" if kind is None else str(kind).lower()
-    if kind_str not in {"classifier", "regressor", "regularity", "area"}:
+        if len(wild_type_target_points) != len(mutant_target_points):
+            raise ValueError(
+                "sampling.restoration.wild_type_target_points must match mutant_target_points in length"
+            )
+    activation_sigma = float(restoration_cfg.get("activation_sigma", 0.35))
+    contact_beta = float(restoration_cfg.get("contact_beta", 12.0))
+    dna_binding_threshold = float(restoration_cfg.get("dna_binding_threshold", 0.65))
+    dna_binding_steepness = float(restoration_cfg.get("dna_binding_steepness", 14.0))
+    if activation_sigma <= 0.0:
+        raise ValueError(f"sampling.restoration.activation_sigma must be > 0, got {activation_sigma}")
+    if contact_beta <= 0.0:
+        raise ValueError(f"sampling.restoration.contact_beta must be > 0, got {contact_beta}")
+    if not 0.0 <= dna_binding_threshold <= 1.0:
         raise ValueError(
-            f"Unsupported sampling.guidance.kind {kind!r}; expected 'classifier', 'regressor', 'regularity', or 'area'. "
-            "Future graph-based guidance models can reuse this interface."
+            f"sampling.restoration.dna_binding_threshold must be in [0, 1], got {dna_binding_threshold}"
         )
-    if checkpoint_path is None and kind_str not in {"regularity", "area"}:
-        raise ValueError("sampling.guidance.checkpoint is required when guidance is enabled")
+    if dna_binding_steepness <= 0.0:
+        raise ValueError(
+            f"sampling.restoration.dna_binding_steepness must be > 0, got {dna_binding_steepness}"
+        )
+
+    success_distance_raw = restoration_cfg.get("success_distance")
+    if success_distance_raw is None:
+        dna_unbound_np = np.asarray(dna_unbound_position, dtype=np.float32)
+        dna_bound_np = np.asarray(dna_bound_position, dtype=np.float32)
+        success_distance = max(float(np.linalg.norm(dna_unbound_np - dna_bound_np)) * 0.10, 1e-6)
+    else:
+        success_distance = float(success_distance_raw)
+    if success_distance <= 0.0:
+        raise ValueError(f"sampling.restoration.success_distance must be > 0, got {success_distance}")
+
+    return RestorationProxyConfig(
+        mutant_target_points=mutant_target_points,
+        wild_type_target_points=wild_type_target_points,
+        ligand_binding_site=ligand_binding_site,
+        dna_unbound_position=dna_unbound_position,
+        dna_bound_position=dna_bound_position,
+        activation_sigma=activation_sigma,
+        contact_beta=contact_beta,
+        dna_binding_threshold=dna_binding_threshold,
+        dna_binding_steepness=dna_binding_steepness,
+        success_distance=success_distance,
+    )
+
+
+def _resolve_guidance_component(
+    component_cfg: dict[str, Any],
+    *,
+    default_kind: str | None,
+) -> GuidanceComponentOptions:
+    kind = component_cfg.get("kind")
+    kind_str = default_kind if kind is None else str(kind).lower()
+    if kind_str is None:
+        raise ValueError("guidance components must define a kind")
+    if kind_str not in {"classifier", "regressor", "regularity", "area", "restoration"}:
+        raise ValueError(
+            f"Unsupported guidance kind {kind!r}; expected 'classifier', 'regressor', 'regularity', 'area', or 'restoration'"
+        )
+
+    checkpoint_path = component_cfg.get("checkpoint")
+    scale = float(component_cfg.get("scale", 1.0))
+    target_class = int(component_cfg.get("target_class", 1))
+    target_value_raw = component_cfg.get("target_value")
+    target_value = None if target_value_raw is None else float(target_value_raw)
+    alpha = float(component_cfg.get("alpha", 8.0))
+    beta = float(component_cfg.get("beta", 5.0))
+    gamma = float(component_cfg.get("gamma", 4.0))
+    min_timestep_weight = float(component_cfg.get("min_timestep_weight", 0.05))
+    timestep_power = float(component_cfg.get("timestep_power", 2.0))
+
     if scale < 0.0:
         raise ValueError(f"sampling.guidance.scale must be >= 0, got {scale}")
+    if checkpoint_path is None and kind_str not in {"regularity", "area", "restoration"}:
+        raise ValueError(f"sampling.guidance.checkpoint is required for {kind_str} guidance")
+    if not 0.0 <= min_timestep_weight <= 1.0:
+        raise ValueError(
+            f"sampling.guidance.min_timestep_weight must be in [0, 1], got {min_timestep_weight}"
+        )
+    if timestep_power <= 0.0:
+        raise ValueError(f"sampling.guidance.timestep_power must be > 0, got {timestep_power}")
 
-    return GuidanceOptions(
-        enabled=True,
+    return GuidanceComponentOptions(
         kind=kind_str,
         checkpoint_path=None if checkpoint_path is None else resolve_project_path(checkpoint_path),
         scale=scale,
@@ -244,7 +364,47 @@ def resolve_guidance_options(sampling_cfg: dict[str, Any]) -> GuidanceOptions:
         alpha=alpha,
         beta=beta,
         gamma=gamma,
+        min_timestep_weight=min_timestep_weight,
+        timestep_power=timestep_power,
     )
+
+
+def resolve_guidance_options(
+    sampling_cfg: dict[str, Any],
+    *,
+    restoration: RestorationProxyConfig | None,
+) -> GuidanceOptions:
+    guidance_cfg = sampling_cfg.get("guidance", {})
+    if guidance_cfg is None:
+        guidance_cfg = {}
+    if not isinstance(guidance_cfg, dict):
+        raise ValueError("sampling.guidance must be a mapping if provided")
+
+    components_cfg = guidance_cfg.get("components")
+    if components_cfg is None:
+        if not bool(guidance_cfg.get("enabled", False)):
+            return GuidanceOptions(enabled=False, components=())
+        components = (_resolve_guidance_component(guidance_cfg, default_kind="classifier"),)
+    else:
+        if not isinstance(components_cfg, list):
+            raise ValueError("sampling.guidance.components must be a list if provided")
+        if not bool(guidance_cfg.get("enabled", True)):
+            return GuidanceOptions(enabled=False, components=())
+        components_list: list[GuidanceComponentOptions] = []
+        for component_cfg in components_cfg:
+            if not isinstance(component_cfg, dict):
+                raise ValueError("each sampling.guidance.components entry must be a mapping")
+            if not bool(component_cfg.get("enabled", True)):
+                continue
+            components_list.append(_resolve_guidance_component(component_cfg, default_kind=None))
+        components = tuple(components_list)
+        if not components:
+            return GuidanceOptions(enabled=False, components=())
+
+    if restoration is None and any(component.kind == "restoration" for component in components):
+        raise ValueError("restoration guidance requires sampling.restoration.enabled: true")
+
+    return GuidanceOptions(enabled=True, components=components)
 
 
 def resolve_size_distribution_options(sampling_cfg: dict[str, Any]) -> SizeDistributionOptions | None:
@@ -317,13 +477,18 @@ def resolve_sampling_request(
         out_path = default_out_path or resolve_project_path(f"data/processed/{DEFAULT_SAMPLES_OUT_NAME}")
     else:
         out_path = resolve_project_path(out_path_value)
+    restoration = resolve_restoration_options(sampling_cfg)
     return SamplingRequest(
         num_samples=num_samples,
         n_steps=n_steps,
         out_path=out_path,
         animation=animation,
         diagnostics=resolve_diagnostics_options(sampling_cfg),
-        guidance=resolve_guidance_options(sampling_cfg),
+        guidance=resolve_guidance_options(
+            sampling_cfg,
+            restoration=restoration,
+        ),
+        restoration=restoration,
         size_distribution=resolve_size_distribution_options(sampling_cfg),
     )
 
@@ -344,6 +509,8 @@ def save_animations(
     trajectories: torch.Tensor | list[torch.Tensor],
     n_vertices: int | None,
     options: AnimationOptions,
+    *,
+    restoration: RestorationProxyConfig | None = None,
 ) -> list[Path]:
     from ..data.plot_polygons import save_polygon_animation
 
@@ -358,12 +525,21 @@ def save_animations(
                 raise ValueError(
                     f"graph trajectory must have shape (frames, n_vertices, 2), got {tuple(trajectory_cpu.shape)}"
                 )
+            display_coords = trajectory_cpu.numpy().astype(np.float32)
+            overlay = None
+            if restoration is not None:
+                display_coords = restoration_scene_coords_numpy(display_coords, restoration)
+                overlay = build_restoration_animation_overlay(
+                    display_coords,
+                    restoration,
+                )
             saved_paths.append(
                 save_polygon_animation(
-                    trajectory_cpu.numpy().astype(np.float32),
+                    display_coords,
                     out_path,
                     fps=options.fps,
                     max_frames=options.max_frames,
+                    restoration_overlay=overlay,
                 )
             )
         return saved_paths
@@ -384,12 +560,18 @@ def save_animations(
     saved_paths: list[Path] = []
     for i, out_path in enumerate(output_paths):
         coords = trajectories_cpu[:, i, :].numpy().reshape(trajectories_cpu.shape[0], n_vertices, 2).astype(np.float32)
+        display_coords = coords
+        overlay = None
+        if restoration is not None:
+            display_coords = restoration_scene_coords_numpy(coords, restoration)
+            overlay = build_restoration_animation_overlay(display_coords, restoration)
         saved_paths.append(
             save_polygon_animation(
-                coords,
+                display_coords,
                 out_path,
                 fps=options.fps,
                 max_frames=options.max_frames,
+                restoration_overlay=overlay,
             )
         )
     return saved_paths
@@ -435,6 +617,8 @@ def write_sampling_diagnostics(
     options: DiagnosticsOptions,
     sampling_n_steps: int,
     sample_run_name: str | None = None,
+    restoration: RestorationProxyConfig | None = None,
+    restoration_trajectory: dict[str, object] | None = None,
 ) -> Path | None:
     if not options.enabled:
         return None
@@ -460,6 +644,14 @@ def write_sampling_diagnostics(
         "reference_summary_source": reference_source,
         "delta_vs_reference": delta_vs_reference,
     }
+    if restoration is not None:
+        payload["restoration_config"] = restoration.to_dict()
+        payload["restoration_summary"] = summarize_restoration_dataset(
+            coords,
+            restoration,
+            num_vertices=num_vertices,
+        )
+        payload["restoration_trajectory"] = restoration_trajectory
 
     diagnostics_out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(diagnostics_out_path, "w", encoding="utf-8") as f:
@@ -471,5 +663,8 @@ def write_sampling_diagnostics(
         print(f"[sample] generated vs reference: {format_polygon_delta_summary(delta_vs_reference)}")
     else:
         print("[sample] no reference summary available for direct comparison")
+    restoration_summary = payload.get("restoration_summary")
+    if isinstance(restoration_summary, dict):
+        print(f"[sample] restoration summary: {format_restoration_summary(restoration_summary)}")
     print(f"[sample] saved diagnostics {diagnostics_out_path}")
     return diagnostics_out_path

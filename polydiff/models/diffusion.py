@@ -390,6 +390,7 @@ class DiffusionConfig:
 
 
 GuidanceGradFn = Callable[..., torch.Tensor]
+SamplingObserverFn = Callable[[torch.Tensor, int, PolygonGraphBatch | None], None]
 
 
 class Diffusion:
@@ -525,6 +526,7 @@ class Diffusion:
         steps: int,
         trajectory_indices: Sequence[int] | None = None,
         guidance_grad: GuidanceGradFn | None = None,
+        observer: SamplingObserverFn | None = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         tracked_indices: list[int] | None = None
         if trajectory_indices is not None:
@@ -539,11 +541,15 @@ class Diffusion:
             trajectory = None
             if tracked_indices is not None:
                 trajectory = [x[tracked_indices].detach().cpu().clone()]
+            if observer is not None:
+                observer(x, steps, None)
             for step in reversed(range(steps)):             # iterate t = steps-1, ..., 0
                 t = torch.full((shape[0],), step, device=self.device, dtype=torch.long) # batch of identical t
                 x = self.p_sample(x, t, guidance_grad=guidance_grad) # sample x_{t-1} from x_t
                 if trajectory is not None:
                     trajectory.append(x[tracked_indices].detach().cpu().clone())
+                if observer is not None:
+                    observer(x, step, None)
 
         if trajectory is None:
             return x, None
@@ -556,6 +562,7 @@ class Diffusion:
         steps: int,
         trajectory_indices: Sequence[int] | None = None,
         guidance_grad: GuidanceGradFn | None = None,
+        observer: SamplingObserverFn | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         tracked_indices: list[int] | None = None
         if trajectory_indices is not None:
@@ -574,6 +581,8 @@ class Diffusion:
                 trajectories = [[] for _ in tracked_indices]
                 for list_index, graph_index in enumerate(tracked_indices):
                     trajectories[list_index].append(x[graph_batch.graph_slice(graph_index)].detach().cpu().clone())
+            if observer is not None:
+                observer(x, steps, graph_batch)
 
             for step in reversed(range(steps)):
                 t = torch.full((graph_batch.batch_size,), step, device=self.device, dtype=torch.long)
@@ -581,6 +590,8 @@ class Diffusion:
                 if trajectories is not None:
                     for list_index, graph_index in enumerate(tracked_indices):
                         trajectories[list_index].append(x[graph_batch.graph_slice(graph_index)].detach().cpu().clone())
+                if observer is not None:
+                    observer(x, step, graph_batch)
 
         if trajectories is None:
             return x, None
@@ -592,10 +603,11 @@ class Diffusion:
         n_steps: Optional[int] = None,
         *,
         guidance_grad: GuidanceGradFn | None = None,
+        observer: SamplingObserverFn | None = None,
     ) -> torch.Tensor:
         """Generate samples starting from pure noise x_T ~ N(0,I)."""
         steps = self._resolve_n_steps(n_steps)
-        x, _ = self._sample_loop(shape, steps=steps, guidance_grad=guidance_grad)
+        x, _ = self._sample_loop(shape, steps=steps, guidance_grad=guidance_grad, observer=observer)
         return x                                            # final x is a generated sample (approx x_0)
 
     def p_sample_loop_graph(
@@ -604,10 +616,11 @@ class Diffusion:
         *,
         n_steps: Optional[int] = None,
         guidance_grad: GuidanceGradFn | None = None,
+        observer: SamplingObserverFn | None = None,
     ) -> tuple[torch.Tensor, PolygonGraphBatch]:
         steps = self._resolve_n_steps(n_steps)
         graph_batch = build_polygon_graph_batch(num_vertices, device=self.device)
-        x, _ = self._sample_graph_loop(graph_batch, steps=steps, guidance_grad=guidance_grad)
+        x, _ = self._sample_graph_loop(graph_batch, steps=steps, guidance_grad=guidance_grad, observer=observer)
         return x, graph_batch
 
     def p_sample_loop_trajectory(
@@ -617,10 +630,17 @@ class Diffusion:
         n_steps: Optional[int] = None,
         trajectory_index: int = 0,
         guidance_grad: GuidanceGradFn | None = None,
+        observer: SamplingObserverFn | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Generate samples and record one sample's denoising trajectory."""
         steps = self._resolve_n_steps(n_steps)
-        x, trajectory = self._sample_loop(shape, steps=steps, trajectory_indices=[trajectory_index], guidance_grad=guidance_grad)
+        x, trajectory = self._sample_loop(
+            shape,
+            steps=steps,
+            trajectory_indices=[trajectory_index],
+            guidance_grad=guidance_grad,
+            observer=observer,
+        )
         if trajectory is None:
             raise RuntimeError("trajectory capture unexpectedly returned no trajectory")
         return x, trajectory[:, 0, :]
@@ -632,6 +652,7 @@ class Diffusion:
         n_steps: Optional[int] = None,
         trajectory_indices: Sequence[int],
         guidance_grad: GuidanceGradFn | None = None,
+        observer: SamplingObserverFn | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Generate samples and record several samples' denoising trajectories."""
         steps = self._resolve_n_steps(n_steps)
@@ -640,6 +661,7 @@ class Diffusion:
             steps=steps,
             trajectory_indices=trajectory_indices,
             guidance_grad=guidance_grad,
+            observer=observer,
         )
         if trajectories is None:
             raise RuntimeError("trajectory capture unexpectedly returned no trajectories")
@@ -652,6 +674,7 @@ class Diffusion:
         n_steps: Optional[int] = None,
         trajectory_indices: Sequence[int],
         guidance_grad: GuidanceGradFn | None = None,
+        observer: SamplingObserverFn | None = None,
     ) -> tuple[torch.Tensor, PolygonGraphBatch, list[torch.Tensor]]:
         steps = self._resolve_n_steps(n_steps)
         graph_batch = build_polygon_graph_batch(num_vertices, device=self.device)
@@ -660,6 +683,7 @@ class Diffusion:
             steps=steps,
             trajectory_indices=trajectory_indices,
             guidance_grad=guidance_grad,
+            observer=observer,
         )
         if trajectories is None:
             raise RuntimeError("trajectory capture unexpectedly returned no trajectories")

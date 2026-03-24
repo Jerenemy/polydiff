@@ -22,29 +22,71 @@ sampling:
   # Optional explicit sample output path. By default this becomes:
   # data/processed/<run_name>/sample_0001__.../samples.npz
   # out_path: "data/processed/custom_samples.npz"
-  # Optional classifier, regressor, analytic regularity, or analytic area guidance.
+  # Optional classifier, regressor, analytic regularity, analytic area, or
+  # analytic restoration guidance.
   # The sampler itself is architecture-agnostic:
   # it only consumes a gradient in x-space, so a future variable-size GNN
   # guidance model can plug into the same interface.
-  guidance:
-    enabled: true
-    kind: regularity   # classifier | regressor | regularity | area
-  #   checkpoint: "models/classifier_final.pt"  # required for classifier/regressor only
-    scale: 10.0
+  # guidance:
+  #   enabled: true
+  #   kind: regularity   # classifier | regressor | regularity | area | restoration
+  # #   checkpoint: "models/classifier_final.pt"  # required for classifier/regressor only
+  #   scale: 10.0
   #   target_class: 1    # classifier only
-  #   target_value: 0.95 # regressor, regularity, or area only; omit to maximize the objective
+  #   target_value: 0.95 # regressor, regularity, area, or restoration only
   #   alpha: 8.0         # regularity only
   #   beta: 5.0          # regularity only
   #   gamma: 4.0         # regularity only
+  # Optional additive guidance terms. If provided, these replace the single
+  # top-level kind/scale fields above.
+  guidance:
+    enabled: true
+    components:
+      # - kind: regularity
+      #   scale: 6.0
+      #   target_value: 0.85
+      - kind: restoration
+        scale: 20.0
+        min_timestep_weight: 0.05
+        timestep_power: 2.0
+  # Optional three-body restoration scene. This is fully opt-in:
+  # ligand binds a mutant protein, the protein is restored toward a WT-like
+  # conformation, and DNA binding becomes possible as a consequence.
+  # If this block is absent or enabled: false, the previous analysis/sampling
+  # path behaves exactly as before.
+  restoration:
+    enabled: true
+    mutant_target_points:
+      - [-1.15, -0.70]
+      - [0.70, -0.82]
+      - [1.05,  0.12]
+      - [0.35,  0.92]
+      - [-0.82, 0.74]
+    wild_type_target_points:
+      - [-1.05, -0.62]
+      - [0.86, -0.78]
+      - [1.26,  0.18]
+      - [0.56,  1.05]
+      - [-0.76, 0.82]
+    ligand_binding_site: [1.00, 0.02]
+    dna_unbound_position: [1.95, 0.15]
+    dna_bound_position: [0.05, 0.15]
+    activation_sigma: 0.50
+    contact_beta: 7.0
+    dna_binding_threshold: 0.68
+    dna_binding_steepness: 8.0
+    success_distance: 0.20
   # Optional GIF export of one sample's reverse diffusion trajectory.
   # By default this becomes:
   # data/processed/<run_name>/sample_0001__.../media/animations/sample_0000.gif
-  # animation:
-  #   out_path: "data/processed/custom_media/animations"
-  #   count: 4
-  #   sample_index: 0
-  #   max_frames: 120
-  #   fps: 12
+  animation:
+    # Leave out_path unset to save GIFs under the corresponding sample run's
+    # own media/animations directory.
+    # out_path: "data/processed/custom_media/animations"
+    count: 20
+    sample_index: 0
+    max_frames: 120
+    fps: 12
   # Diagnostics are enabled by default and written next to samples as
   # data/processed/<run_name>/sample_0001__.../samples.diagnostics.json. Override here if needed.
   # diagnostics:

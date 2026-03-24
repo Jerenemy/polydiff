@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from .. import paths
+from ..restoration import RestorationAnimationOverlay
 from .gen_polygons import centroid_xy, enforce_ccw, normalize_scale_rms, regularity_score
 from .polygon_dataset import PolygonDatasetArrays, load_polygon_dataset
 
@@ -76,6 +77,7 @@ def save_polygon_animation(
     *,
     fps: int = 12,
     max_frames: int = 120,
+    restoration_overlay: RestorationAnimationOverlay | None = None,
 ) -> Path:
     """Save a GIF showing one polygon's denoising trajectory."""
     if fps < 1:
@@ -94,32 +96,184 @@ def save_polygon_animation(
         raise RuntimeError("saving GIF animations requires Pillow; install it with `poetry add pillow`") from exc
 
     frames, frame_indices = select_animation_frames(coords, max_frames=max_frames)
+    overlay = None if restoration_overlay is None else restoration_overlay.select_frames(frame_indices)
 
-    x_min = float(frames[:, :, 0].min())
-    x_max = float(frames[:, :, 0].max())
-    y_min = float(frames[:, :, 1].min())
-    y_max = float(frames[:, :, 1].max())
+    x_arrays = [frames[:, :, 0].reshape(-1)]
+    y_arrays = [frames[:, :, 1].reshape(-1)]
+    if overlay is not None:
+        if overlay.mutant_target_points.size > 0:
+            x_arrays.append(overlay.mutant_target_points[:, 0])
+            y_arrays.append(overlay.mutant_target_points[:, 1])
+        if overlay.wild_type_target_points.size > 0:
+            x_arrays.append(overlay.wild_type_target_points[:, 0])
+            y_arrays.append(overlay.wild_type_target_points[:, 1])
+        if overlay.protein_points.size > 0:
+            x_arrays.append(overlay.protein_points[:, :, 0].reshape(-1))
+            y_arrays.append(overlay.protein_points[:, :, 1].reshape(-1))
+        x_arrays.extend(
+            [
+                overlay.ligand_binding_site[0:1],
+                overlay.dna_unbound_position[0:1],
+                overlay.dna_bound_position[0:1],
+                overlay.contact_points[:, 0],
+                overlay.dna_positions[:, 0],
+            ]
+        )
+        y_arrays.extend(
+            [
+                overlay.ligand_binding_site[1:2],
+                overlay.dna_unbound_position[1:2],
+                overlay.dna_bound_position[1:2],
+                overlay.contact_points[:, 1],
+                overlay.dna_positions[:, 1],
+            ]
+        )
+
+    x_all = np.concatenate(x_arrays, axis=0)
+    y_all = np.concatenate(y_arrays, axis=0)
+    x_min = float(x_all.min())
+    x_max = float(x_all.max())
+    y_min = float(y_all.min())
+    y_max = float(y_all.max())
 
     x_pad = max((x_max - x_min) * 0.15, 0.25)
     y_pad = max((y_max - y_min) * 0.15, 0.25)
 
-    fig, ax = plt.subplots(figsize=(4, 4))
+    if overlay is None:
+        fig, ax = plt.subplots(figsize=(4, 4))
+        fig.subplots_adjust(left=0.05, right=0.95, bottom=0.05, top=0.90)
+        title_x = 0.5
+        title_size = 11
+    else:
+        fig, ax = plt.subplots(figsize=(8.8, 5.2))
+        fig.subplots_adjust(left=0.06, right=0.68, bottom=0.08, top=0.82)
+        title_x = 0.36
+        title_size = 14
     line, = ax.plot([], [], color="black", linewidth=2)
     points = ax.scatter([], [], s=18, color="black")
-    title = ax.set_title("")
+    title = fig.suptitle("", x=title_x, y=0.96, ha="center", va="top", fontsize=title_size)
+    protein_line = None
+    contact_point_artist = None
+    contact_line_artist = None
+    dna_point_artist = None
 
     ax.set_aspect("equal")
     ax.axis("off")
     ax.set_xlim(x_min - x_pad, x_max + x_pad)
     ax.set_ylim(y_min - y_pad, y_max + y_pad)
 
+    if overlay is not None:
+        if overlay.mutant_target_points.shape[0] >= 2:
+            mutant_closed = np.vstack([overlay.mutant_target_points, overlay.mutant_target_points[0]])
+            ax.plot(
+                mutant_closed[:, 0],
+                mutant_closed[:, 1],
+                color="0.75",
+                linewidth=1.5,
+                linestyle="-",
+                label="mutant protein",
+            )
+        elif overlay.mutant_target_points.shape[0] == 1:
+            ax.scatter(
+                overlay.mutant_target_points[:, 0],
+                overlay.mutant_target_points[:, 1],
+                s=24,
+                color="0.75",
+                label="mutant protein",
+            )
+        if overlay.wild_type_target_points.shape[0] >= 2:
+            wt_closed = np.vstack([overlay.wild_type_target_points, overlay.wild_type_target_points[0]])
+            ax.plot(
+                wt_closed[:, 0],
+                wt_closed[:, 1],
+                color="tab:green",
+                linewidth=1.2,
+                linestyle="--",
+                alpha=0.7,
+                label="WT protein",
+            )
+        elif overlay.wild_type_target_points.shape[0] == 1:
+            ax.scatter(
+                overlay.wild_type_target_points[:, 0],
+                overlay.wild_type_target_points[:, 1],
+                s=24,
+                color="tab:green",
+                alpha=0.7,
+                label="WT protein",
+            )
+        protein_line, = ax.plot([], [], color="tab:blue", linewidth=1.8, label="restored protein")
+        ax.plot(
+            [overlay.dna_unbound_position[0], overlay.dna_bound_position[0]],
+            [overlay.dna_unbound_position[1], overlay.dna_bound_position[1]],
+            color="0.7",
+            linewidth=1.0,
+            linestyle="--",
+        )
+        ax.scatter(
+            [overlay.ligand_binding_site[0]],
+            [overlay.ligand_binding_site[1]],
+            marker="x",
+            s=48,
+            color="tab:purple",
+            label="ligand site",
+        )
+        ax.scatter(
+            [overlay.dna_unbound_position[0]],
+            [overlay.dna_unbound_position[1]],
+            s=36,
+            facecolors="none",
+            edgecolors="tab:red",
+            linewidths=1.5,
+            label="DNA unbound",
+        )
+        ax.scatter(
+            [overlay.dna_bound_position[0]],
+            [overlay.dna_bound_position[1]],
+            s=36,
+            facecolors="none",
+            edgecolors="tab:green",
+            linewidths=1.5,
+            label="DNA bound",
+        )
+        contact_line_artist, = ax.plot([], [], color="tab:blue", linewidth=1.0, linestyle="--")
+        contact_point_artist = ax.scatter([], [], marker="x", s=36, color="tab:blue", label="ligand contact")
+        dna_point_artist = ax.scatter([], [], s=32, color="tab:orange", label="DNA")
+        ax.legend(
+            loc="center left",
+            bbox_to_anchor=(1.02, 0.5),
+            borderaxespad=0.0,
+            frameon=False,
+            fontsize=8,
+        )
+
     def _update(frame_idx: int):
         xy = frames[frame_idx]
         xy_closed = np.vstack([xy, xy[0]])
         line.set_data(xy_closed[:, 0], xy_closed[:, 1])
         points.set_offsets(xy)
-        title.set_text(f"frame {frame_indices[frame_idx] + 1}/{coords.shape[0]}")
-        return line, points, title
+        if overlay is None:
+            title.set_text(f"frame {frame_indices[frame_idx] + 1}/{coords.shape[0]}")
+            return line, points, title
+
+        contact_xy = overlay.contact_points[frame_idx]
+        dna_xy = overlay.dna_positions[frame_idx]
+        protein_xy = overlay.protein_points[frame_idx]
+        protein_closed = np.vstack([protein_xy, protein_xy[0]])
+        protein_line.set_data(protein_closed[:, 0], protein_closed[:, 1])
+        contact_point_artist.set_offsets(contact_xy.reshape(1, 2))
+        dna_point_artist.set_offsets(dna_xy.reshape(1, 2))
+        contact_line_artist.set_data(
+            [contact_xy[0], overlay.ligand_binding_site[0]],
+            [contact_xy[1], overlay.ligand_binding_site[1]],
+        )
+        title.set_text(
+            f"frame {frame_indices[frame_idx] + 1}/{coords.shape[0]} | "
+            f"restore={overlay.protein_restoration[frame_idx]:.2f} | "
+            f"dna_bind={overlay.dna_binding_activation[frame_idx]:.2f}\n"
+            f"contact_d={overlay.contact_drift[frame_idx]:.2f} | "
+            f"dna_d={overlay.dna_distance[frame_idx]:.2f}"
+        )
+        return line, points, protein_line, title, contact_point_artist, dna_point_artist, contact_line_artist
 
     animation = FuncAnimation(
         fig,

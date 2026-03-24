@@ -18,7 +18,10 @@ Important sampling knobs:
 
 - `sampling.n_steps`: reverse-diffusion step count override
 - `sampling.size_distribution.values/probabilities`: optional polygon-size prior for GAT/GCN sampling
-- `sampling.guidance.*`: classifier, regressor, analytic regularity, or analytic area guidance
+- `sampling.guidance.*`: classifier, regressor, analytic regularity, analytic area, or restoration guidance
+- restoration guidance also accepts `min_timestep_weight` and `timestep_power` to ramp its strength over reverse diffusion
+- `sampling.guidance.components`: optional additive guidance terms while preserving the legacy single-guidance form
+- `sampling.restoration.*`: explicit opt-in ligand -> restored protein -> DNA-binding scene used by restoration guidance, diagnostics, and GIF overlays
 - `sampling.diagnostics.*`: reference comparison JSON output
 - `sampling.animation.*`: GIF export of reverse trajectories
 

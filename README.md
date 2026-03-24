@@ -258,15 +258,17 @@ That keeps the sampler generic: it only needs a gradient with respect to `x_t`, 
 
 ### Guidance Model Types
 
-The current code supports four guidance modes:
+The current code supports five guidance modes:
 
 - `classifier`
 - `regressor`
 - `regularity`
 - `area`
+- `restoration`
 
 The first two are time-conditioned MLPs over the flattened noisy polygon. They live in [`polydiff/models/guidance_models.py`](polydiff/models/guidance_models.py).
-The last two are analytic, differentiable PyTorch objectives in [`polydiff/models/regularity_torch.py`](polydiff/models/regularity_torch.py).
+`regularity` and `area` are analytic geometry objectives in [`polydiff/models/regularity_torch.py`](polydiff/models/regularity_torch.py).
+`restoration` is an analytic three-body objective in [`polydiff/restoration.py`](polydiff/restoration.py).
 
 Shared idea:
 
@@ -278,10 +280,11 @@ Current limitations:
 
 - the learned classifier/regressor guidance models are still fixed-size MLPs
 - checkpoint-backed classifier/regressor guidance only supports uniform-size sampled batches
-- analytic `regularity` and `area` guidance now work on mixed-size GAT/GCN batches
+- analytic `regularity`, `area`, and `restoration` guidance now work on mixed-size GAT/GCN batches
 - guidance-model training is still fixed-size only
 - the analytic regularity path is differentiable, but it still omits the discrete self-intersection test because that part of the original NumPy score is not autograd-friendly
 - the analytic area path can easily encourage scale blow-up, because increasing polygon area is often easiest by just making the sample larger
+- the restoration scene is completely opt-in and only exists when `sampling.restoration.enabled: true`
 
 ### Classifier Guidance
 
@@ -428,6 +431,34 @@ Relevant code:
 - differentiable area: [`polydiff/models/regularity_torch.py`](polydiff/models/regularity_torch.py)
 - analytic guidance wrapper: [`polydiff/sampling/guidance.py`](polydiff/sampling/guidance.py)
 
+### Analytic Restoration Guidance
+
+Restoration guidance adds an explicit three-body toy scene:
+
+- a fixed mutant protein geometry
+- the generated polygon acting as a ligand
+- a DNA body with unbound and bound reference positions
+
+The intended causal story is:
+
+```text
+ligand contact -> protein restoration -> DNA-binding competence -> DNA bound pose
+```
+
+The proxy uses a differentiable soft contact point on the polygon boundary relative to a configured ligand-binding site. That contact drives a continuous protein-restoration score, the protein geometry interpolates from mutant toward WT-like geometry, and DNA binding turns on as a sigmoid of the restoration score. The guidance objective minimizes the final DNA-to-bound-state distance, not raw contact by itself.
+
+Restoration guidance is also timestep-aware during sampling: its effective strength is ramped up over reverse diffusion so very noisy early states are not pushed as aggressively as late near-denoised states.
+
+This entire path is opt-in. If `sampling.restoration` is absent or `enabled: false`, the previous sampling and diagnostics behavior stays unchanged.
+
+Relevant code:
+
+- restoration proxy and diagnostics helpers: [`polydiff/restoration.py`](polydiff/restoration.py)
+- analytic guidance wrapper: [`polydiff/sampling/guidance.py`](polydiff/sampling/guidance.py)
+- GIF overlay hook: [`polydiff/data/plot_polygons.py`](polydiff/data/plot_polygons.py)
+
+For a focused explanation of what the toy restoration setup is claiming, see [`docs/restoration_analogue.md`](docs/restoration_analogue.md).
+
 ### Training A Guidance Model
 
 The guidance training entrypoint is `train_guidance_model.py`, and it supports both classifier and regressor guidance models.
@@ -455,7 +486,7 @@ Relevant code:
 
 ### Enabling Guidance During Sampling
 
-Sampling config now supports:
+Sampling config now supports the legacy single-guidance form:
 
 ```yaml
 sampling:
@@ -467,6 +498,42 @@ sampling:
     target_class: 1    # classifier only
     # target_value: 0.95  # regressor only
 ```
+
+It also supports additive terms:
+
+```yaml
+sampling:
+  guidance:
+    enabled: true
+    components:
+      - kind: regularity
+        scale: 6.0
+      - kind: restoration
+        scale: 14.0
+        min_timestep_weight: 0.05
+        timestep_power: 2.0
+  restoration:
+    enabled: true
+    mutant_target_points:
+      - [-1.15, -0.70]
+      - [0.70, -0.82]
+      - [1.05,  0.12]
+    wild_type_target_points:
+      - [-1.05, -0.62]
+      - [0.86, -0.78]
+      - [1.26,  0.18]
+    ligand_binding_site: [1.00, 0.02]
+    dna_unbound_position: [1.95, 0.15]
+    dna_bound_position: [0.05, 0.15]
+    dna_binding_threshold: 0.68
+    dna_binding_steepness: 16.0
+```
+
+Important toggle behavior:
+
+- legacy classifier/regressor/regularity/area sampling still works with no restoration block
+- restoration diagnostics and GIF overlays only activate when `sampling.restoration.enabled: true`
+- restoration guidance additionally requires a `restoration` guidance term in `sampling.guidance`
 
 Relevant code:
 
