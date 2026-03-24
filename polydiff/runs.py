@@ -214,17 +214,31 @@ def create_run_paths(
     model_root = paths.ensure_dir(model_root or paths.MODELS_DIR)
     processed_root = paths.ensure_dir(processed_root or paths.PROCESSED_DATA_DIR)
 
+    slug_parts = [slugify(experiment_name), slugify(model_type), slugify(data_path.stem)]
+    slug = "-".join(part for part in slug_parts if part)
     existing_numbers = [parse_run_number(p.name) or 0 for p in list_model_run_dirs(model_root)]
     next_number = (max(existing_numbers) + 1) if existing_numbers else 1
 
-    slug_parts = [slugify(experiment_name), slugify(model_type), slugify(data_path.stem)]
-    run_name = f"run_{next_number:04d}__{'-'.join(part for part in slug_parts if part)}"
-    return run_paths_for_name(
-        run_name,
-        model_root=model_root,
-        processed_root=processed_root,
-        create_missing=True,
-    )
+    while True:
+        run_name = f"run_{next_number:04d}__{slug}" if slug else f"run_{next_number:04d}"
+        model_dir = model_root / run_name
+        try:
+            model_dir.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            next_number += 1
+            continue
+
+        processed_dir = processed_root / run_name
+        media_dir = processed_dir / "media"
+        processed_dir.mkdir(parents=True, exist_ok=True)
+        media_dir.mkdir(parents=True, exist_ok=True)
+        return RunPaths(
+            run_name=run_name,
+            run_number=next_number,
+            model_dir=model_dir,
+            processed_dir=processed_dir,
+            media_dir=media_dir,
+        )
 
 
 def create_sampling_run_paths(
@@ -233,18 +247,31 @@ def create_sampling_run_paths(
     label: str,
     processed_root: Path | None = None,
 ) -> SampleRunPaths:
+    processed_root = processed_root or paths.PROCESSED_DATA_DIR
     existing_numbers = [
         parse_sample_run_number(p.name) or 0 for p in list_sampling_run_dirs(run_name, processed_root=processed_root)
     ]
     next_number = (max(existing_numbers) + 1) if existing_numbers else 1
     slug = slugify(label)
-    sample_run_name = f"sample_{next_number:04d}__{slug}" if slug else f"sample_{next_number:04d}"
-    return sample_run_paths_for_name(
-        run_name,
-        sample_run_name,
-        processed_root=processed_root,
-        create_missing=True,
-    )
+    run_paths = run_paths_for_name(run_name, processed_root=processed_root, create_missing=True)
+    while True:
+        sample_run_name = f"sample_{next_number:04d}__{slug}" if slug else f"sample_{next_number:04d}"
+        processed_dir = run_paths.processed_dir / sample_run_name
+        try:
+            processed_dir.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            next_number += 1
+            continue
+
+        media_dir = processed_dir / "media"
+        media_dir.mkdir(parents=True, exist_ok=True)
+        return SampleRunPaths(
+            model_run_name=run_name,
+            sample_run_name=sample_run_name,
+            sample_run_number=next_number,
+            processed_dir=processed_dir,
+            media_dir=media_dir,
+        )
 
 
 def write_run_files(

@@ -27,6 +27,13 @@ class StudySummaryOptions:
 
 
 @dataclass(frozen=True, slots=True)
+class StudyParallelOptions:
+    enabled: bool
+    max_workers: int
+    require_cuda: bool
+
+
+@dataclass(frozen=True, slots=True)
 class StudyCase:
     name: str
     kind: str
@@ -40,6 +47,7 @@ class StudySpec:
     config_path: Path
     root_dir: Path
     summary: StudySummaryOptions
+    parallel: StudyParallelOptions
     cases: tuple[StudyCase, ...]
 
 
@@ -102,6 +110,14 @@ def load_study_spec(config_path: Path) -> StudySpec:
         summary_cfg = {}
     if not isinstance(summary_cfg, dict):
         raise ValueError("study.summary must be a mapping if provided")
+    parallel_cfg = study_cfg.get("parallel", {})
+    if parallel_cfg is None:
+        parallel_cfg = {}
+    if not isinstance(parallel_cfg, dict):
+        raise ValueError("study.parallel must be a mapping if provided")
+    max_workers = int(parallel_cfg.get("max_workers", 2))
+    if max_workers < 1:
+        raise ValueError(f"study.parallel.max_workers must be >= 1, got {max_workers}")
 
     cases: list[StudyCase] = []
     for case_cfg in cases_cfg:
@@ -145,6 +161,11 @@ def load_study_spec(config_path: Path) -> StudySpec:
             representative_count=int(summary_cfg.get("representative_count", 16)),
             outlier_count=int(summary_cfg.get("outlier_count", 16)),
             max_projection_points=int(summary_cfg.get("max_projection_points", 2000)),
+        ),
+        parallel=StudyParallelOptions(
+            enabled=bool(parallel_cfg.get("enabled", False)),
+            max_workers=max_workers,
+            require_cuda=bool(parallel_cfg.get("require_cuda", True)),
         ),
         cases=tuple(cases),
     )
@@ -241,6 +262,11 @@ def write_study_metadata(path: Path, *, spec: StudySpec, paths_obj: StudyPaths) 
             "representative_count": spec.summary.representative_count,
             "outlier_count": spec.summary.outlier_count,
             "max_projection_points": spec.summary.max_projection_points,
+        },
+        "parallel": {
+            "enabled": spec.parallel.enabled,
+            "max_workers": spec.parallel.max_workers,
+            "require_cuda": spec.parallel.require_cuda,
         },
         "cases": [
             {

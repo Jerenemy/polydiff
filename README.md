@@ -229,6 +229,8 @@ Use the study runner when you want a reproducible thesis-style sweep instead of 
 python -m polydiff.studies.run --config configs/study_minimum_high_honors.yaml
 ```
 
+Set `study.parallel.enabled: true` when you want the study runner to launch dependency-independent cases in parallel. By default that mode only activates when CUDA is available; use `study.parallel.require_cuda: false` if you intentionally want the same scheduler on CPU.
+
 Study cases can:
 
 - train diffusion runs

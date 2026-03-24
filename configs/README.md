@@ -29,6 +29,9 @@ Important sampling knobs:
 Important study-manifest knobs:
 
 - `study.root_dir`: where numbered `study_*` folders are written
+- `study.parallel.enabled`: opt into dependency-aware parallel case execution
+- `study.parallel.max_workers`: maximum number of ready cases to run at once
+- `study.parallel.require_cuda`: require `torch.cuda.is_available()` before enabling parallel mode
 - `study.summary.reference_data_path`: reference dataset used for galleries and PCA
 - `cases[*].kind`: `train_diffusion` | `train_guidance_model` | `sample_diffusion`
 - `cases[*].overrides`: dotted-path config overrides applied to the case config

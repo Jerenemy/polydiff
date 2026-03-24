@@ -5,6 +5,10 @@
 study:
   name: "minimum-high-honors"
   root_dir: "data/studies"
+  parallel:
+    enabled: false
+    max_workers: 2
+    require_cuda: true
   summary:
     reference_data_path: "data/raw/hexagons.npz"
     representative_count: 12

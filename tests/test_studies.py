@@ -18,7 +18,7 @@ from polydiff.data.polygon_dataset import load_polygon_dataset
 from polydiff.data.gen_polygons import batch
 from polydiff.models.diffusion import build_denoiser
 from polydiff.studies.run import _add_tradeoff_labels, refresh_study_outputs, run_study_from_config
-from polydiff.studies.runtime import apply_dotted_overrides, resolve_case_placeholders
+from polydiff.studies.runtime import apply_dotted_overrides, load_study_spec, resolve_case_placeholders
 
 
 def test_metric_tables_capture_distribution_shift():
@@ -58,6 +58,40 @@ def test_runtime_override_helpers_support_placeholders():
 
     assert resolved["model"]["run"] == "run_0001__baseline"
     assert resolved["sampling"]["num_samples"] == 16
+
+
+def test_load_study_spec_parses_parallel_options(tmp_path):
+    sample_config_path = tmp_path / "sample.yaml"
+    sample_config_path.write_text("sampling:\n  num_samples: 4\n", encoding="utf-8")
+    config_path = tmp_path / "study.yaml"
+    with open(config_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(
+            {
+                "study": {
+                    "name": "parallel-study",
+                    "parallel": {
+                        "enabled": True,
+                        "max_workers": 3,
+                        "require_cuda": False,
+                    },
+                },
+                "cases": [
+                    {
+                        "name": "sample-a",
+                        "kind": "sample_diffusion",
+                        "config": str(sample_config_path),
+                    }
+                ],
+            },
+            f,
+            sort_keys=False,
+        )
+
+    spec = load_study_spec(config_path)
+
+    assert spec.parallel.enabled is True
+    assert spec.parallel.max_workers == 3
+    assert spec.parallel.require_cuda is False
 
 
 def test_tradeoff_label_layout_avoids_overlap_for_close_points():
@@ -234,3 +268,115 @@ def test_run_study_from_config_executes_sample_case_and_writes_reports(tmp_path)
 
     refreshed_summary_df = pd.read_csv(Path(refreshed_report_payload["summary_csv_path"]))
     assert "distribution_distances.shape_distribution_shift_mean_normalized_w1" in refreshed_summary_df.columns
+
+
+def test_run_study_from_config_supports_parallel_case_execution(tmp_path):
+    reference_coords, _, _ = batch(n=4, num=16, seed=11, radial_sigma=0.08, angle_sigma=0.04, smooth_passes=4)
+    reference_path = tmp_path / "reference.npz"
+    np.savez_compressed(reference_path, coords=reference_coords.astype(np.float32), n=np.int32(4))
+
+    model = build_denoiser(
+        data_dim=8,
+        model_cfg={
+            "type": "mlp",
+            "hidden_dim": 16,
+            "time_emb_dim": 8,
+            "num_layers": 1,
+        },
+    )
+    checkpoint_path = tmp_path / "diffusion_checkpoint.pt"
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "diffusion": {"n_steps": 4, "beta_start": 1e-4, "beta_end": 2e-2},
+            "model_cfg": {"type": "mlp", "hidden_dim": 16, "time_emb_dim": 8, "num_layers": 1},
+            "n_vertices": 4,
+            "max_vertices": 4,
+            "global_step": 0,
+            "run_name": None,
+            "training_data_path": str(reference_path),
+            "training_data_summary": summarize_polygon_dataset(reference_coords),
+        },
+        checkpoint_path,
+    )
+
+    sample_config_path = tmp_path / "sample_parallel.yaml"
+    with open(sample_config_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(
+            {
+                "experiment_name": "parallel-study-sample",
+                "seed": 0,
+                "device": "cpu",
+                "model": {},
+                "sampling": {
+                    "num_samples": 4,
+                    "guidance": {"enabled": False},
+                    "restoration": {"enabled": False},
+                    "diagnostics": {"enabled": True, "reference_data_path": str(reference_path)},
+                },
+            },
+            f,
+            sort_keys=False,
+        )
+
+    study_config_path = tmp_path / "study_parallel.yaml"
+    with open(study_config_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(
+            {
+                "study": {
+                    "name": "parallel-study",
+                    "root_dir": str(tmp_path / "studies"),
+                    "parallel": {
+                        "enabled": True,
+                        "max_workers": 2,
+                        "require_cuda": False,
+                    },
+                    "summary": {
+                        "reference_data_path": str(reference_path),
+                        "representative_count": 4,
+                        "outlier_count": 4,
+                        "max_projection_points": 128,
+                    },
+                },
+                "cases": [
+                    {
+                        "name": "sample-a",
+                        "kind": "sample_diffusion",
+                        "config": str(sample_config_path),
+                        "overrides": {
+                            "model.checkpoint": str(checkpoint_path),
+                            "sampling.out_path": str(tmp_path / "sample_a.npz"),
+                        },
+                    },
+                    {
+                        "name": "sample-b",
+                        "kind": "sample_diffusion",
+                        "config": str(sample_config_path),
+                        "overrides": {
+                            "model.checkpoint": str(checkpoint_path),
+                            "sampling.out_path": str(tmp_path / "sample_b.npz"),
+                        },
+                    },
+                ],
+            },
+            f,
+            sort_keys=False,
+        )
+
+    report_path = run_study_from_config(study_config_path)
+    with open(report_path, "r", encoding="utf-8") as f:
+        report_payload = json.load(f)
+
+    assert report_payload["status"] == "completed"
+    assert report_payload["parallel"]["enabled"] is True
+    assert report_payload["current_case_names"] == []
+
+    case_results_path = Path(report_payload["case_results_path"])
+    with open(case_results_path, "r", encoding="utf-8") as f:
+        case_results_payload = json.load(f)
+
+    for case_name in ("sample-a", "sample-b"):
+        case_result = case_results_payload[case_name]
+        assert Path(case_result["samples_out_path"]).exists()
+        assert Path(case_result["diagnostics_path"]).exists()
+        assert Path(case_result["study_case_log_path"]).exists()

@@ -5,11 +5,16 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import re
+import subprocess
+import sys
+import time
 from typing import Any
 
 import matplotlib.pyplot as plt
 from matplotlib.transforms import Bbox
 import pandas as pd
+import torch
 
 from ..data.diagnostics import (
     DEFAULT_SCORE_THRESHOLDS,
@@ -38,6 +43,7 @@ from ..utils.runtime import load_yaml_config, resolve_project_path
 from .plots import save_pca_projection_figure, save_polygon_gallery, save_score_distribution_figure
 from .runtime import (
     StudyCase,
+    StudyParallelOptions,
     StudyPaths,
     StudySpec,
     apply_dotted_overrides,
@@ -49,6 +55,8 @@ from .runtime import (
     write_study_metadata,
     write_yaml_config,
 )
+
+_PLACEHOLDER_RE = re.compile(r"^\{\{([^{}.]+)\.([^{}.]+)\}\}$")
 
 
 def _bbox_overlap_area(a: Bbox, b: Bbox) -> float:
@@ -154,6 +162,149 @@ def _add_tradeoff_labels(
             placed_boxes.append(best_bbox)
             annotations.append(best_annotation)
     return annotations
+
+
+def _case_placeholder_dependencies(value: Any) -> set[str]:
+    dependencies: set[str] = set()
+    if isinstance(value, dict):
+        for inner in value.values():
+            dependencies.update(_case_placeholder_dependencies(inner))
+        return dependencies
+    if isinstance(value, list):
+        for inner in value:
+            dependencies.update(_case_placeholder_dependencies(inner))
+        return dependencies
+    if not isinstance(value, str):
+        return dependencies
+
+    match = _PLACEHOLDER_RE.match(value.strip())
+    if match is not None:
+        dependencies.add(match.group(1))
+    return dependencies
+
+
+def _study_case_dependencies(spec: StudySpec) -> dict[str, set[str]]:
+    known_case_names = {case.name for case in spec.cases}
+    dependencies: dict[str, set[str]] = {}
+    for case in spec.cases:
+        case_dependencies = _case_placeholder_dependencies(case.overrides)
+        unknown = case_dependencies - known_case_names
+        if unknown:
+            raise KeyError(
+                f"Study case {case.name!r} references unknown placeholder case(s): {sorted(unknown)}"
+            )
+        if case.name in case_dependencies:
+            raise ValueError(f"Study case {case.name!r} cannot depend on itself")
+        dependencies[case.name] = case_dependencies
+    return dependencies
+
+
+def _parallel_execution_enabled(parallel: StudyParallelOptions) -> tuple[bool, str | None]:
+    if not parallel.enabled:
+        return False, None
+    if parallel.max_workers < 2:
+        return False, "study.parallel.max_workers < 2"
+    if parallel.require_cuda and not torch.cuda.is_available():
+        return False, "CUDA is not available"
+    return True, None
+
+
+def _resolve_case_execution(
+    *,
+    case_index: int,
+    case: StudyCase,
+    spec: StudySpec,
+    paths_obj: StudyPaths,
+    case_results: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], Path]:
+    base_cfg = load_yaml_config(case.config_path)
+    resolved_overrides = resolve_case_placeholders(case.overrides, case_results=case_results)
+    resolved_cfg = apply_dotted_overrides(base_cfg, resolved_overrides)
+    if "experiment_name" not in case.overrides:
+        resolved_cfg["experiment_name"] = f"{spec.name}-{case.name}"
+    resolved_config_path = write_yaml_config(
+        paths_obj.configs_dir / f"{case_index:02d}__{slugify(case.name)}.yaml",
+        resolved_cfg,
+    )
+    return resolved_cfg, resolved_config_path
+
+
+def _case_result_temp_path(*, paths_obj: StudyPaths, case_index: int, case_name: str) -> Path:
+    return paths_obj.reports_dir / "tmp" / f"{case_index:02d}__{slugify(case_name)}.result.json"
+
+
+def _case_log_path(*, paths_obj: StudyPaths, case_index: int, case_name: str) -> Path:
+    return paths_obj.reports_dir / "logs" / f"{case_index:02d}__{slugify(case_name)}.log"
+
+
+def _run_case_entrypoint(*, kind: str, name: str, config_path: Path, result_path: Path) -> Path:
+    resolved_config = load_yaml_config(config_path)
+    case = StudyCase(name=name, kind=kind, config_path=config_path, overrides={})
+    result = _run_case(case, resolved_config=resolved_config, resolved_config_path=config_path)
+    return _write_json(result_path, result)
+
+
+def _launch_case_process(
+    *,
+    case: StudyCase,
+    case_index: int,
+    resolved_config_path: Path,
+    paths_obj: StudyPaths,
+) -> dict[str, Any]:
+    result_path = _case_result_temp_path(paths_obj=paths_obj, case_index=case_index, case_name=case.name)
+    log_path = _case_log_path(paths_obj=paths_obj, case_index=case_index, case_name=case.name)
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = open(log_path, "w", encoding="utf-8")
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "polydiff.studies.run",
+            "--run-case-kind",
+            case.kind,
+            "--run-case-name",
+            case.name,
+            "--run-case-config",
+            str(resolved_config_path),
+            "--run-case-result",
+            str(result_path),
+        ],
+        cwd=str(resolve_project_path(".")),
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    return {
+        "case_index": case_index,
+        "case": case,
+        "result_path": result_path,
+        "log_path": log_path,
+        "log_file": log_file,
+        "process": process,
+    }
+
+
+def _terminate_running_processes(running_processes: dict[str, dict[str, Any]]) -> None:
+    for entry in running_processes.values():
+        process = entry["process"]
+        if process.poll() is None:
+            process.terminate()
+    deadline = time.time() + 5.0
+    for entry in running_processes.values():
+        process = entry["process"]
+        if process.poll() is not None:
+            continue
+        timeout = max(deadline - time.time(), 0.0)
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5.0)
+    for entry in running_processes.values():
+        log_file = entry.get("log_file")
+        if log_file is not None and not log_file.closed:
+            log_file.close()
 
 
 def _run_case(case: StudyCase, *, resolved_config: dict[str, Any], resolved_config_path: Path) -> dict[str, Any]:
@@ -529,6 +680,50 @@ def _summarize_sample_cases(
     return summary_payload, rows, figure_paths_by_case
 
 
+def _ingest_case_result(
+    *,
+    spec: StudySpec,
+    paths_obj: StudyPaths,
+    case: StudyCase,
+    case_result: dict[str, Any],
+    case_results: dict[str, dict[str, Any]],
+    case_results_path: Path,
+    case_report_paths_by_case: dict[str, str],
+    sample_rows: list[dict[str, Any]],
+    figure_paths_by_case: dict[str, dict[str, str]],
+    summary_payload: dict[str, Any],
+) -> dict[str, Any]:
+    case_results[case.name] = case_result
+    _write_case_results(case_results_path, case_results)
+
+    case_report_path = _write_case_report(paths_obj=paths_obj, case_name=case.name, case_result=case_result)
+    case_report_paths_by_case[case.name] = str(case_report_path)
+
+    if case_result.get("case_kind") == "sample_diffusion":
+        row, figure_paths = _build_sample_case_summary_entry(
+            spec=spec,
+            paths_obj=paths_obj,
+            case_name=case.name,
+            case_result=case_result,
+        )
+        sample_rows.append(row)
+        figure_paths_by_case[case.name] = figure_paths
+        case_report_path = _write_case_report(
+            paths_obj=paths_obj,
+            case_name=case.name,
+            case_result=case_result,
+            figure_paths=figure_paths,
+            summary_row=row,
+        )
+        case_report_paths_by_case[case.name] = str(case_report_path)
+        return _write_sample_summary_outputs(
+            paths_obj=paths_obj,
+            rows=sample_rows,
+            figure_paths_by_case=figure_paths_by_case,
+        )
+    return summary_payload
+
+
 def _write_study_report(
     *,
     paths_obj: StudyPaths,
@@ -539,21 +734,31 @@ def _write_study_report(
     case_report_paths_by_case: dict[str, str],
     status: str,
     current_case_name: str | None = None,
+    current_case_names: list[str] | None = None,
     error: dict[str, str] | None = None,
 ) -> Path:
     completed_case_names = [case.name for case in spec.cases if case.name in case_results]
     missing_case_names = [case.name for case in spec.cases if case.name not in case_results]
+    running_case_names = [] if current_case_names is None else [str(name) for name in current_case_names]
+    if current_case_name is None and running_case_names:
+        current_case_name = running_case_names[0]
     report_payload = {
         "study_name": paths_obj.study_name,
         "study_dir": str(paths_obj.study_dir),
         "status": status,
         "current_case_name": current_case_name,
+        "current_case_names": running_case_names,
         "completed_cases": len(completed_case_names),
         "total_cases": len(spec.cases),
         "completed_case_names": completed_case_names,
         "missing_case_names": missing_case_names,
         "case_results_path": None if case_results_path is None else str(case_results_path),
         "case_report_paths_by_case": case_report_paths_by_case,
+        "parallel": {
+            "enabled": spec.parallel.enabled,
+            "max_workers": spec.parallel.max_workers,
+            "require_cuda": spec.parallel.require_cuda,
+        },
         **summary_payload,
     }
     if error is not None:
@@ -565,6 +770,10 @@ def run_study_from_config(config_path: Path) -> Path:
     spec = load_study_spec(config_path)
     paths_obj = create_study_paths(name=spec.name, root_dir=spec.root_dir)
     write_study_metadata(paths_obj.study_dir / "study_metadata.json", spec=spec, paths_obj=paths_obj)
+    dependency_map = _study_case_dependencies(spec)
+    parallel_enabled, parallel_disabled_reason = _parallel_execution_enabled(spec.parallel)
+    if spec.parallel.enabled and not parallel_enabled and parallel_disabled_reason is not None:
+        print(f"[study] parallel execution disabled: {parallel_disabled_reason}; falling back to serial execution")
 
     case_results: dict[str, dict[str, Any]] = {}
     case_results_path = paths_obj.reports_dir / "case_results.json"
@@ -586,10 +795,97 @@ def run_study_from_config(config_path: Path) -> Path:
         status="running",
     )
 
-    current_case_name: str | None = None
+    pending_cases: dict[str, tuple[int, StudyCase]] = {
+        case.name: (case_index, case)
+        for case_index, case in enumerate(spec.cases, start=1)
+    }
+    running_processes: dict[str, dict[str, Any]] = {}
+    max_parallel_workers = spec.parallel.max_workers if parallel_enabled else 1
     try:
-        for case_index, case in enumerate(spec.cases, start=1):
-            current_case_name = case.name
+        while pending_cases or running_processes:
+            completed_case_names = set(case_results.keys())
+            ready_cases = [
+                (case_index, case)
+                for case_index, case in enumerate(spec.cases, start=1)
+                if case.name in pending_cases and dependency_map[case.name].issubset(completed_case_names)
+            ]
+
+            if not parallel_enabled:
+                if not ready_cases:
+                    unresolved = {
+                        case.name: sorted(dependency_map[case.name] - completed_case_names)
+                        for _, case in pending_cases.values()
+                    }
+                    raise RuntimeError(f"No runnable study cases remain; unresolved dependencies: {unresolved}")
+
+                case_index, case = ready_cases[0]
+                del pending_cases[case.name]
+                _write_study_report(
+                    paths_obj=paths_obj,
+                    spec=spec,
+                    case_results=case_results,
+                    case_results_path=case_results_path if case_results else None,
+                    summary_payload=summary_payload,
+                    case_report_paths_by_case=case_report_paths_by_case,
+                    status="running",
+                    current_case_name=case.name,
+                    current_case_names=[case.name],
+                )
+                resolved_cfg, resolved_config_path = _resolve_case_execution(
+                    case_index=case_index,
+                    case=case,
+                    spec=spec,
+                    paths_obj=paths_obj,
+                    case_results=case_results,
+                )
+                print(f"[study] running case {case_index}/{len(spec.cases)} name={case.name} kind={case.kind}")
+                case_result = _run_case(
+                    case,
+                    resolved_config=resolved_cfg,
+                    resolved_config_path=resolved_config_path,
+                )
+                summary_payload = _ingest_case_result(
+                    spec=spec,
+                    paths_obj=paths_obj,
+                    case=case,
+                    case_result=case_result,
+                    case_results=case_results,
+                    case_results_path=case_results_path,
+                    case_report_paths_by_case=case_report_paths_by_case,
+                    sample_rows=sample_rows,
+                    figure_paths_by_case=figure_paths_by_case,
+                    summary_payload=summary_payload,
+                )
+                final_report_path = _write_study_report(
+                    paths_obj=paths_obj,
+                    spec=spec,
+                    case_results=case_results,
+                    case_results_path=case_results_path,
+                    summary_payload=summary_payload,
+                    case_report_paths_by_case=case_report_paths_by_case,
+                    status="running",
+                )
+                continue
+
+            available_slots = max(0, max_parallel_workers - len(running_processes))
+            for case_index, case in ready_cases[:available_slots]:
+                del pending_cases[case.name]
+                _, resolved_config_path = _resolve_case_execution(
+                    case_index=case_index,
+                    case=case,
+                    spec=spec,
+                    paths_obj=paths_obj,
+                    case_results=case_results,
+                )
+                print(f"[study] launching case {case_index}/{len(spec.cases)} name={case.name} kind={case.kind}")
+                running_processes[case.name] = _launch_case_process(
+                    case=case,
+                    case_index=case_index,
+                    resolved_config_path=resolved_config_path,
+                    paths_obj=paths_obj,
+                )
+
+            running_case_names = list(running_processes.keys())
             _write_study_report(
                 paths_obj=paths_obj,
                 spec=spec,
@@ -598,66 +894,68 @@ def run_study_from_config(config_path: Path) -> Path:
                 summary_payload=summary_payload,
                 case_report_paths_by_case=case_report_paths_by_case,
                 status="running",
-                current_case_name=current_case_name,
+                current_case_names=running_case_names,
             )
 
-            base_cfg = load_yaml_config(case.config_path)
-            resolved_overrides = resolve_case_placeholders(case.overrides, case_results=case_results)
-            resolved_cfg = apply_dotted_overrides(base_cfg, resolved_overrides)
-            if "experiment_name" not in case.overrides:
-                resolved_cfg["experiment_name"] = f"{spec.name}-{case.name}"
-            resolved_config_path = write_yaml_config(
-                paths_obj.configs_dir / f"{case_index:02d}__{slugify(case.name)}.yaml",
-                resolved_cfg,
-            )
-            print(f"[study] running case {case_index}/{len(spec.cases)} name={case.name} kind={case.kind}")
+            if not running_processes:
+                unresolved = {
+                    case.name: sorted(dependency_map[case.name] - completed_case_names)
+                    for _, case in pending_cases.values()
+                }
+                raise RuntimeError(f"No runnable study cases remain; unresolved dependencies: {unresolved}")
 
-            case_result = _run_case(
-                case,
-                resolved_config=resolved_cfg,
-                resolved_config_path=resolved_config_path,
-            )
-            case_results[case.name] = case_result
-            _write_case_results(case_results_path, case_results)
+            completed_entries: list[dict[str, Any]] = []
+            while not completed_entries:
+                for case_name, entry in list(running_processes.items()):
+                    return_code = entry["process"].poll()
+                    if return_code is None:
+                        continue
+                    entry["log_file"].close()
+                    del running_processes[case_name]
+                    entry["return_code"] = int(return_code)
+                    completed_entries.append(entry)
+                if not completed_entries:
+                    time.sleep(0.25)
 
-            case_report_path = _write_case_report(paths_obj=paths_obj, case_name=case.name, case_result=case_result)
-            case_report_paths_by_case[case.name] = str(case_report_path)
-
-            if case_result.get("case_kind") == "sample_diffusion":
-                row, figure_paths = _build_sample_case_summary_entry(
+            for entry in completed_entries:
+                case = entry["case"]
+                log_path = entry["log_path"]
+                if entry["return_code"] != 0:
+                    _terminate_running_processes(running_processes)
+                    raise RuntimeError(
+                        f"Study case {case.name!r} failed with exit code {entry['return_code']}; see {log_path}"
+                    )
+                case_result = _load_json(entry["result_path"])
+                if case_result is None:
+                    _terminate_running_processes(running_processes)
+                    raise FileNotFoundError(
+                        f"Study case {case.name!r} did not write a result file at {entry['result_path']}"
+                    )
+                case_result["study_case_log_path"] = str(log_path)
+                summary_payload = _ingest_case_result(
                     spec=spec,
                     paths_obj=paths_obj,
-                    case_name=case.name,
+                    case=case,
                     case_result=case_result,
-                )
-                sample_rows.append(row)
-                figure_paths_by_case[case.name] = figure_paths
-                case_report_path = _write_case_report(
-                    paths_obj=paths_obj,
-                    case_name=case.name,
-                    case_result=case_result,
-                    figure_paths=figure_paths,
-                    summary_row=row,
-                )
-                case_report_paths_by_case[case.name] = str(case_report_path)
-                summary_payload = _write_sample_summary_outputs(
-                    paths_obj=paths_obj,
-                    rows=sample_rows,
+                    case_results=case_results,
+                    case_results_path=case_results_path,
+                    case_report_paths_by_case=case_report_paths_by_case,
+                    sample_rows=sample_rows,
                     figure_paths_by_case=figure_paths_by_case,
+                    summary_payload=summary_payload,
                 )
-
-            final_report_path = _write_study_report(
-                paths_obj=paths_obj,
-                spec=spec,
-                case_results=case_results,
-                case_results_path=case_results_path,
-                summary_payload=summary_payload,
-                case_report_paths_by_case=case_report_paths_by_case,
-                status="running",
-                current_case_name=current_case_name,
-            )
-            current_case_name = None
+                final_report_path = _write_study_report(
+                    paths_obj=paths_obj,
+                    spec=spec,
+                    case_results=case_results,
+                    case_results_path=case_results_path,
+                    summary_payload=summary_payload,
+                    case_report_paths_by_case=case_report_paths_by_case,
+                    status="running",
+                    current_case_names=list(running_processes.keys()),
+                )
     except Exception as exc:
+        _terminate_running_processes(running_processes)
         final_report_path = _write_study_report(
             paths_obj=paths_obj,
             spec=spec,
@@ -666,7 +964,7 @@ def run_study_from_config(config_path: Path) -> Path:
             summary_payload=summary_payload,
             case_report_paths_by_case=case_report_paths_by_case,
             status="failed",
-            current_case_name=current_case_name,
+            current_case_names=list(running_processes.keys()),
             error={"type": type(exc).__name__, "message": str(exc)},
         )
         raise
@@ -774,8 +1072,43 @@ def main() -> None:
         type=str,
         help="rebuild study reports and figures from an existing study directory",
     )
+    group.add_argument(
+        "--run-case-config",
+        type=str,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--run-case-kind",
+        type=str,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--run-case-name",
+        type=str,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--run-case-result",
+        type=str,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
 
+    if args.run_case_config is not None:
+        if args.run_case_kind is None or args.run_case_name is None or args.run_case_result is None:
+            raise ValueError(
+                "--run-case-config requires --run-case-kind, --run-case-name, and --run-case-result"
+            )
+        _run_case_entrypoint(
+            kind=str(args.run_case_kind),
+            name=str(args.run_case_name),
+            config_path=resolve_project_path(args.run_case_config),
+            result_path=resolve_project_path(args.run_case_result),
+        )
+        return
     if args.refresh_study_dir is not None:
         refresh_study_outputs(resolve_project_path(args.refresh_study_dir))
         return
