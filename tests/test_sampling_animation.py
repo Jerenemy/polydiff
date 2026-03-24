@@ -12,6 +12,12 @@ class ZeroModel(nn.Module):
         return torch.zeros_like(x)
 
 
+class ZeroGraphModel(nn.Module):
+    def forward(self, x, t, *, batch=None):
+        del t, batch
+        return torch.zeros_like(x)
+
+
 def test_p_sample_loop_trajectory_matches_standard_sampling():
     diffusion = Diffusion(model=ZeroModel(), config=DiffusionConfig(n_steps=4))
 
@@ -44,3 +50,26 @@ def test_select_animation_frames_keeps_endpoints_when_downsampling():
     assert np.all(np.diff(indices) > 0)
     assert np.array_equal(frames[0], coords[0])
     assert np.array_equal(frames[-1], coords[-1])
+
+
+def test_p_sample_loop_graph_trajectories_track_variable_sizes():
+    diffusion = Diffusion(model=ZeroGraphModel(), config=DiffusionConfig(n_steps=4))
+    num_vertices = [5, 7, 6]
+
+    torch.manual_seed(7)
+    expected, expected_batch = diffusion.p_sample_loop_graph(num_vertices, n_steps=4)
+
+    torch.manual_seed(7)
+    actual, actual_batch, trajectories = diffusion.p_sample_loop_graph_trajectories(
+        num_vertices,
+        n_steps=4,
+        trajectory_indices=[1, 2],
+    )
+
+    assert torch.allclose(actual, expected)
+    assert actual_batch.num_vertices.tolist() == expected_batch.num_vertices.tolist() == num_vertices
+    assert len(trajectories) == 2
+    assert trajectories[0].shape == (5, 7, 2)
+    assert trajectories[1].shape == (5, 6, 2)
+    assert torch.allclose(trajectories[0][-1], actual[actual_batch.graph_slice(1)].cpu())
+    assert torch.allclose(trajectories[1][-1], actual[actual_batch.graph_slice(2)].cpu())

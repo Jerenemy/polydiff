@@ -25,6 +25,17 @@ from polydiff.training.train import train_from_config
 from polydiff.sampling.sample import sample_from_config
 ```
 
+## Variable-Size Note
+
+The core codebase now supports ragged variable-size polygon datasets for `gat` and `gcn`.
+
+Notebook status is mixed:
+
+- utility code in `polydiff.data` now loads dense and ragged polygon files
+- some older notebooks still assume a fixed `n_vertices` field and will need manual updates before they work on mixed-size datasets
+
+In particular, comparison notebooks that align polygons vertex-by-vertex are still conceptually fixed-size unless they are rewritten to group or resample by polygon size.
+
 ## Common import issue
 
 If Jupyter is launched from `notebooks/`, `import polydiff` can fail because the repo root is not on `sys.path`.

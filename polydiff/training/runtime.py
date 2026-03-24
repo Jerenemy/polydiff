@@ -129,11 +129,12 @@ def run_sample_diagnostics(
     diffusion: Diffusion,
     *,
     num_samples: int,
-    data_dim: int,
-    n_vertices: int,
+    data_dim: int | None,
+    n_vertices: int | None,
+    reference_num_vertices: np.ndarray | None,
     n_steps: int | None,
     seed: int | None,
-    reference_summary: dict[str, float | int],
+    reference_summary: dict[str, float | int | dict[int, int]],
 ) -> tuple[dict[str, float | int], dict[str, float]]:
     cpu_rng_state = torch.random.get_rng_state()
     cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
@@ -145,9 +146,28 @@ def run_sample_diagnostics(
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
 
-        samples = diffusion.p_sample_loop((num_samples, data_dim), n_steps=n_steps)
-        coords = samples.detach().cpu().numpy().reshape(num_samples, n_vertices, 2).astype(np.float32)
-        summary = summarize_polygon_dataset(coords)
+        if reference_num_vertices is None:
+            if data_dim is None or n_vertices is None:
+                raise ValueError("data_dim and n_vertices are required for fixed-size sample diagnostics")
+            samples = diffusion.p_sample_loop((num_samples, data_dim), n_steps=n_steps)
+            coords = samples.detach().cpu().numpy().reshape(num_samples, n_vertices, 2).astype(np.float32)
+            summary = summarize_polygon_dataset(coords)
+        else:
+            rng = np.random.default_rng(seed)
+            sampled_num_vertices = rng.choice(
+                np.asarray(reference_num_vertices, dtype=np.int32).reshape(-1),
+                size=num_samples,
+                replace=True,
+            ).astype(np.int32)
+            samples, graph_batch = diffusion.p_sample_loop_graph(
+                sampled_num_vertices.tolist(),
+                n_steps=n_steps,
+            )
+            coords = samples.detach().cpu().numpy().astype(np.float32)
+            summary = summarize_polygon_dataset(
+                coords,
+                num_vertices=graph_batch.num_vertices.detach().cpu().numpy().astype(np.int32),
+            )
         deltas = compare_polygon_summaries(reference_summary, summary)
         return summary, deltas
     finally:
@@ -163,18 +183,20 @@ def save_checkpoint(
     model: torch.nn.Module,
     diffusion_config: DiffusionConfig,
     model_cfg: dict[str, Any],
-    n_vertices: int,
+    n_vertices: int | None,
+    max_vertices: int,
     global_step: int,
     run_name: str | None,
     training_data_path: Path,
-    training_data_summary: dict[str, float | int],
+    training_data_summary: dict[str, float | int | dict[int, int]],
     config_path: Path,
 ) -> None:
     checkpoint = {
         "model_state": model.state_dict(),
         "diffusion": asdict(diffusion_config),
         "model_cfg": model_cfg,
-        "n_vertices": n_vertices,
+        "n_vertices": None if n_vertices is None else int(n_vertices),
+        "max_vertices": int(max_vertices),
         "global_step": int(global_step),
         "run_name": run_name,
         "training_data_path": str(training_data_path),

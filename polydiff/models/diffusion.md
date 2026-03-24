@@ -1,5 +1,17 @@
 # `polydiff/models/diffusion.py` Reference
 
+## Status Update
+
+The codebase no longer assumes fixed-size polygons everywhere.
+
+Current behavior:
+
+- `DenoiseMLP` is still fixed-size and operates on flattened `(B, 2n)` tensors
+- `DenoiseGAT` and `DenoiseGCN` now support variable-size polygons through ragged graph batches
+- variable-size GAT/GCN training and sampling use concatenated node tensors plus per-graph `num_vertices`, not padded storage
+
+The conceptual discussion below still contains fixed-size examples because that was the original baseline setup, but the implementation status has changed. For a focused description of the current ragged GAT/GCN pipeline, see [`../../docs/variable_size_pipeline.md`](../../docs/variable_size_pipeline.md).
+
 This document explains the current diffusion stack and all three denoisers:
 
 - `DenoiseMLP`
@@ -612,24 +624,24 @@ So if you wanted one model to handle many polygon sizes, the ranking would usual
 - conceptually: GNN is more appropriate
 - conceptually: plain MLP is less appropriate
 
-### Important implementation caveat
+### Current implementation status
 
-That is the conceptual answer. The current codebase still assumes fixed `num_vertices` in the denoiser wrappers.
+That conceptual change is now reflected in the code:
 
-Relevant code:
+- `DenoiseMLP` is still fixed-size
+- `DenoiseGAT` and `DenoiseGCN` now support variable-size polygons through ragged graph batches
 
-- fixed `num_vertices` derived from `data_dim`: [`diffusion.py`](diffusion.py) lines 67-71 and 180-182
-- fixed cycle positional features buffer in GAT: [`diffusion.py`](diffusion.py) lines 78-82
-- fixed cycle edge construction from `self.num_vertices`: [`diffusion.py`](diffusion.py) lines 114-148 and 206-237
+Implemented pieces:
 
-So the current `DenoiseMLP`, `DenoiseGAT`, and `DenoiseGCN` are all built for one fixed polygon size per model instance.
+- per-sample ragged graph batching
+- dynamic cycle-edge construction per polygon
+- positional features computed from each polygon's own `n`
+- diffusion loss and sampling paths that operate on concatenated node tensors plus per-graph sizes
 
-To truly support varying-size polygons in one model, you would likely need at least:
+So the current codebase now matches the conceptual recommendation:
 
-- ragged or batched graph handling by sample
-- dynamic edge construction per polygon
-- positional features that depend on each polygon's own `n`
-- a loss and batching path that can handle variable-length polygons cleanly
+- fixed-size polygons: MLP, GAT, and GCN all work
+- variable-size polygons: use GAT or GCN
 
 ### Would an MLP still ever be reasonable?
 

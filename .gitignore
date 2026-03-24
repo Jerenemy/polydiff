@@ -32,6 +32,7 @@ pip-wheel-metadata/
 .DS_Store
 
 # Local training artifacts
+models/run_*/
 models/*.pt
 models/**/*.pt
 pretrained_models/*.pt

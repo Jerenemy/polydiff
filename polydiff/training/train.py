@@ -8,10 +8,11 @@ import time
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 
 from .. import paths
 from ..data.diagnostics import summarize_polygon_dataset
+from ..data.polygon_dataset import PolygonDatasetArrays, collate_polygon_graph_batch, load_polygon_dataset
 from ..models.diffusion import Diffusion, DiffusionConfig, build_denoiser
 from ..runs import create_run_paths, write_run_files
 from ..utils.runtime import device_from_config, load_yaml_config, resolve_project_path, set_seed
@@ -30,6 +31,17 @@ from .runtime import (
 )
 
 
+class _PolygonArrayDataset(Dataset[torch.Tensor]):
+    def __init__(self, data: PolygonDatasetArrays) -> None:
+        self.data = data
+
+    def __len__(self) -> int:
+        return self.data.num_polygons
+
+    def __getitem__(self, index: int) -> torch.Tensor:
+        return torch.from_numpy(self.data.polygon(index))
+
+
 def train_from_config(config_path: Path) -> None:
     cfg = load_yaml_config(config_path)
 
@@ -42,17 +54,39 @@ def train_from_config(config_path: Path) -> None:
     shuffle = bool(data_cfg.get("shuffle", True))
     num_workers = int(data_cfg.get("num_workers", 0))
 
-    data = np.load(data_path)
-    coords = data["coords"].astype(np.float32)
-    n_vertices = coords.shape[1]
-    x = coords.reshape(coords.shape[0], -1)
-
-    dataset = TensorDataset(torch.from_numpy(x))
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
-
     model_cfg = dict(cfg.get("model", {}))
     model_cfg.setdefault("type", "gat")
-    model = build_denoiser(data_dim=x.shape[1], model_cfg=model_cfg)
+    model_type = str(model_cfg.get("type", "gat")).lower()
+
+    polygon_data = load_polygon_dataset(data_path)
+    coords_shape = tuple(polygon_data.coords.shape)
+    n_vertices = int(polygon_data.num_vertices[0]) if polygon_data.is_uniform and polygon_data.num_polygons > 0 else None
+    max_vertices = int(polygon_data.max_vertices)
+
+    if model_type == "mlp":
+        if not polygon_data.is_uniform:
+            raise ValueError("model.type='mlp' only supports fixed-size polygon datasets")
+        coords = polygon_data.to_dense()
+        x = coords.reshape(coords.shape[0], -1)
+        dataset = TensorDataset(torch.from_numpy(x))
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
+        model_data_dim = x.shape[1]
+    elif model_type in {"gat", "gcn"}:
+        coords = None
+        x = None
+        dataset = _PolygonArrayDataset(polygon_data)
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            collate_fn=collate_polygon_graph_batch,
+        )
+        model_data_dim = max_vertices * 2
+    else:
+        raise ValueError(f"Unsupported model.type {model_type!r}; expected one of: mlp, gat, gcn")
+
+    model = build_denoiser(data_dim=model_data_dim, model_cfg=model_cfg)
 
     diff_cfg = cfg.get("diffusion", {})
     diffusion_config = DiffusionConfig(
@@ -122,7 +156,7 @@ def train_from_config(config_path: Path) -> None:
             "training_cfg": train_cfg,
         },
     )
-    reference_summary = summarize_polygon_dataset(coords)
+    reference_summary = summarize_polygon_dataset(polygon_data)
     optimizer = torch.optim.Adam(model.parameters(), lr=train_options.lr)
 
     log_both_info(
@@ -141,7 +175,7 @@ def train_from_config(config_path: Path) -> None:
         seed=seed,
         device=device,
         data_path=data_path,
-        coords_shape=tuple(coords.shape),
+        coords_shape=coords_shape,
         model_cfg=model_cfg,
         diffusion_config=diffusion_config,
         training_cfg=train_cfg,
@@ -155,11 +189,16 @@ def train_from_config(config_path: Path) -> None:
     last_log_step = -1
 
     for epoch in range(train_options.epochs):
-        for (batch_x,) in loader:
+        for batch in loader:
             model.train()
 
-            batch_x = batch_x.to(device)
-            loss, loss_stats = diffusion.loss(batch_x, return_stats=True)
+            if model_type == "mlp":
+                (batch_x,) = batch
+                batch_x = batch_x.to(device)
+                loss, loss_stats = diffusion.loss(batch_x, return_stats=True)
+            else:
+                batch_graph = batch.to(device)
+                loss, loss_stats = diffusion.loss(batch_graph.coords, graph_batch=batch_graph, return_stats=True)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -197,8 +236,9 @@ def train_from_config(config_path: Path) -> None:
                 sample_summary, sample_deltas = run_sample_diagnostics(
                     diffusion,
                     num_samples=train_options.sample_diagnostics_num_samples,
-                    data_dim=x.shape[1],
+                    data_dim=None if x is None else x.shape[1],
                     n_vertices=n_vertices,
+                    reference_num_vertices=None if model_type == "mlp" else polygon_data.num_vertices,
                     n_steps=train_options.sample_diagnostics_n_steps,
                     seed=train_options.sample_diagnostics_seed,
                     reference_summary=reference_summary,
@@ -226,6 +266,7 @@ def train_from_config(config_path: Path) -> None:
                     diffusion_config=diffusion_config,
                     model_cfg=model_cfg,
                     n_vertices=n_vertices,
+                    max_vertices=max_vertices,
                     global_step=global_step,
                     run_name=run_paths.run_name,
                     training_data_path=data_path,
@@ -243,6 +284,7 @@ def train_from_config(config_path: Path) -> None:
         diffusion_config=diffusion_config,
         model_cfg=model_cfg,
         n_vertices=n_vertices,
+        max_vertices=max_vertices,
         global_step=global_step,
         run_name=run_paths.run_name,
         training_data_path=data_path,

@@ -16,6 +16,7 @@ from .gen_polygons import (
     polygon_signed_area_xy,
     regularity_score,
 )
+from .polygon_dataset import PolygonDatasetArrays, vertex_count_histogram
 
 
 def anchor_index(xy: np.ndarray) -> int:
@@ -73,22 +74,48 @@ def polygon_metric_row(xy: np.ndarray) -> dict[str, float]:
     }
 
 
-def summarize_polygon_dataset(coords: np.ndarray) -> dict[str, float | int]:
-    """Aggregate polygon metrics for an entire dataset."""
-    coords = np.asarray(coords, dtype=np.float32)
-    if coords.ndim != 3 or coords.shape[-1] != 2:
-        raise ValueError(f"coords must have shape (num_polygons, n_vertices, 2), got {coords.shape}")
+def _as_polygon_dataset(
+    coords: np.ndarray | PolygonDatasetArrays,
+    num_vertices: np.ndarray | None = None,
+) -> PolygonDatasetArrays:
+    if isinstance(coords, PolygonDatasetArrays):
+        if num_vertices is not None:
+            raise ValueError("num_vertices must not be provided when coords is already a PolygonDatasetArrays object")
+        return coords
+    coords_array = np.asarray(coords, dtype=np.float32)
+    if num_vertices is None:
+        if coords_array.ndim != 3:
+            raise ValueError(
+                "coords must have shape (num_polygons, n_vertices, 2) when num_vertices is omitted, "
+                f"got {coords_array.shape}"
+            )
+        num_vertices = np.full((coords_array.shape[0],), coords_array.shape[1], dtype=np.int32)
+    return PolygonDatasetArrays(coords=coords_array, num_vertices=num_vertices)
 
-    rows = [polygon_metric_row(xy) for xy in coords]
+
+def summarize_polygon_dataset(
+    coords: np.ndarray | PolygonDatasetArrays,
+    num_vertices: np.ndarray | None = None,
+) -> dict[str, float | int | dict[int, int]]:
+    """Aggregate polygon metrics for an entire dataset."""
+    dataset = _as_polygon_dataset(coords, num_vertices=num_vertices)
+    if dataset.num_polygons == 0:
+        raise ValueError("cannot summarize an empty polygon dataset")
+
+    rows = [polygon_metric_row(xy) for xy in dataset.iter_polygons()]
     metrics = {
         key: np.asarray([row[key] for row in rows], dtype=np.float64)
         for key in rows[0]
     }
+    num_vertices_array = np.asarray(dataset.num_vertices, dtype=np.float64)
 
     score = metrics["score"]
-    out: dict[str, float | int] = {
-        "num_polygons": int(coords.shape[0]),
-        "n_vertices": int(coords.shape[1]),
+    out: dict[str, float | int | dict[int, int]] = {
+        "num_polygons": int(dataset.num_polygons),
+        "min_vertices": int(dataset.num_vertices.min()),
+        "max_vertices": int(dataset.num_vertices.max()),
+        "mean_vertices": float(num_vertices_array.mean()),
+        "vertex_count_histogram": vertex_count_histogram(dataset.num_vertices),
         "raw_centroid_norm_mean": float(metrics["raw_centroid_norm"].mean()),
         "raw_centroid_norm_std": float(metrics["raw_centroid_norm"].std()),
         "raw_rms_radius_mean": float(metrics["raw_rms_radius"].mean()),
@@ -110,6 +137,8 @@ def summarize_polygon_dataset(coords: np.ndarray) -> dict[str, float | int]:
         "min_radius_mean": float(metrics["min_radius"].mean()),
         "max_radius_mean": float(metrics["max_radius"].mean()),
     }
+    if dataset.is_uniform and dataset.num_polygons > 0:
+        out["n_vertices"] = int(dataset.num_vertices[0])
     return out
 
 
@@ -125,6 +154,7 @@ def compare_polygon_summaries(
         "self_intersection_rate",
         "score_mean",
         "score_std",
+        "mean_vertices",
         "edge_cv_mean",
         "angle_cv_mean",
         "radius_cv_mean",
@@ -140,8 +170,17 @@ def compare_polygon_summaries(
 
 def format_polygon_summary(summary: dict[str, float | int]) -> str:
     """Compact human-readable summary for logs."""
+    n_vertices = summary.get("n_vertices")
+    if n_vertices is None:
+        vertices_text = (
+            f"vertices={int(summary['min_vertices'])}-{int(summary['max_vertices'])} "
+            f"(mean={float(summary['mean_vertices']):.2f})"
+        )
+    else:
+        vertices_text = f"vertices={int(n_vertices)}"
     return (
         f"n={int(summary['num_polygons'])} "
+        f"{vertices_text} "
         f"score={float(summary['score_mean']):.4f}±{float(summary['score_std']):.4f} "
         f"edge_cv={float(summary['edge_cv_mean']):.4f} "
         f"angle_cv={float(summary['angle_cv_mean']):.4f} "
@@ -160,6 +199,7 @@ def format_polygon_delta_summary(deltas: dict[str, float]) -> str:
     ordered = [
         ("score_mean_delta", "score"),
         ("score_std_delta", "score_std"),
+        ("mean_vertices_delta", "vertices"),
         ("edge_cv_mean_delta", "edge_cv"),
         ("angle_cv_mean_delta", "angle_cv"),
         ("radius_cv_mean_delta", "radius_cv"),

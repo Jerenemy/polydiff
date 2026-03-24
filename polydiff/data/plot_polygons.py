@@ -17,13 +17,14 @@ import numpy as np
 
 from .. import paths
 from .gen_polygons import centroid_xy, enforce_ccw, normalize_scale_rms, regularity_score
+from .polygon_dataset import PolygonDatasetArrays, load_polygon_dataset
 
 
-def _compute_scores(coords: np.ndarray) -> np.ndarray:
+def _compute_scores(dataset: PolygonDatasetArrays) -> np.ndarray:
     """Compute regularity scores from polygon coordinates."""
-    score = np.empty((coords.shape[0],), dtype=np.float32)
-    for i in range(coords.shape[0]):
-        xy = coords[i].astype(np.float64, copy=True)
+    score = np.empty((dataset.num_polygons,), dtype=np.float32)
+    for i, xy_source in enumerate(dataset.iter_polygons()):
+        xy = xy_source.astype(np.float64, copy=True)
         # Match generator scoring assumptions.
         xy = xy - centroid_xy(xy)
         xy = normalize_scale_rms(xy)
@@ -147,18 +148,18 @@ def plot_file(
     data_dir = paths.RAW_DATA_DIR
     file_path = paths.resolve_path(file, data_dir)
 
-    data = np.load(file_path)
-    coords = data["coords"]
-    score = data["score"] if "score" in data else None
+    dataset = load_polygon_dataset(file_path)
+    with np.load(file_path, allow_pickle=True) as data:
+        score = np.asarray(data["score"], dtype=np.float32) if "score" in data else None
     if score is None and compute_score:
-        score = _compute_scores(coords)
+        score = _compute_scores(dataset)
 
     use_score_color = color_by_score or (score is not None and not no_color_by_score)
     # Preserve original behavior for training/generated data:
     # if score exists in the file, show numeric labels by default.
     use_show_scores = (score is not None) or show_scores or compute_score
 
-    num = min(num, coords.shape[0])
+    num = min(num, dataset.num_polygons)
     cols = int(math.ceil(math.sqrt(num)))
     rows = int(math.ceil(num / cols))
 
@@ -168,7 +169,7 @@ def plot_file(
     for i in range(num):
         plot_polygon(
             axes[i],
-            coords[i],
+            dataset.polygon(i),
             score=None if score is None else score[i],
             color_by_score=use_score_color,
         )

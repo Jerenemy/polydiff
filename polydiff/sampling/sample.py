@@ -93,6 +93,50 @@ def resolve_checkpoint_from_run_selection(
     return checkpoint_path, infer_run_name_from_checkpoint_path(checkpoint_path)
 
 
+def _checkpoint_vertex_distribution(checkpoint: dict[str, object], *, fallback_size: int) -> tuple[np.ndarray, np.ndarray]:
+    summary = checkpoint.get("training_data_summary")
+    if isinstance(summary, dict):
+        histogram = summary.get("vertex_count_histogram")
+        if isinstance(histogram, dict) and histogram:
+            sizes = np.asarray(sorted(int(key) for key in histogram.keys()), dtype=np.int32)
+            counts = np.asarray([int(histogram[str(size)]) if str(size) in histogram else int(histogram[size]) for size in sizes], dtype=np.float64)
+            probs = counts / counts.sum()
+            return sizes, probs.astype(np.float64)
+
+    n_vertices = checkpoint.get("n_vertices")
+    if n_vertices is not None:
+        return np.asarray([int(n_vertices)], dtype=np.int32), np.asarray([1.0], dtype=np.float64)
+    return np.asarray([int(fallback_size)], dtype=np.int32), np.asarray([1.0], dtype=np.float64)
+
+
+def _resolve_sample_num_vertices(
+    *,
+    checkpoint: dict[str, object],
+    request_num_samples: int,
+    model_type: str,
+    fallback_size: int,
+    requested_distribution: object,
+    seed: int,
+) -> np.ndarray:
+    if requested_distribution is not None:
+        values = np.asarray(requested_distribution.values, dtype=np.int32)
+        probabilities = np.asarray(requested_distribution.probabilities, dtype=np.float64)
+    else:
+        values, probabilities = _checkpoint_vertex_distribution(checkpoint, fallback_size=fallback_size)
+
+    if model_type == "mlp":
+        if values.shape[0] != 1:
+            raise ValueError("MLP checkpoints only support a single fixed polygon size during sampling")
+        if int(values[0]) != int(fallback_size):
+            raise ValueError(
+                f"MLP checkpoint expects n_vertices={int(fallback_size)}, got requested size {int(values[0])}"
+            )
+        return np.full((request_num_samples,), int(values[0]), dtype=np.int32)
+
+    rng = np.random.default_rng(seed)
+    return rng.choice(values, size=request_num_samples, replace=True, p=probabilities).astype(np.int32)
+
+
 def sample_from_config(config_path: Path, *, cli_overrides: SampleCliOverrides | None = None) -> None:
     cli_overrides = cli_overrides or SampleCliOverrides()
     cfg = load_yaml_config(config_path)
@@ -107,10 +151,13 @@ def sample_from_config(config_path: Path, *, cli_overrides: SampleCliOverrides |
         model_cfg,
         run_override=cli_overrides.run,
     )
-    checkpoint, diffusion, diffusion_config, n_vertices = load_diffusion_from_checkpoint(
+    checkpoint, diffusion, diffusion_config, max_vertices = load_diffusion_from_checkpoint(
         checkpoint_path,
         device=device,
     )
+    checkpoint_model_cfg = dict(checkpoint.get("model_cfg", {}))
+    checkpoint_model_cfg.setdefault("type", "gat")
+    model_type = str(checkpoint_model_cfg.get("type", "gat")).lower()
     run_name = str(checkpoint.get("run_name") or requested_run_name or infer_run_name_from_checkpoint_path(checkpoint_path) or "")
     sample_run_paths = None
     if run_name:
@@ -170,6 +217,11 @@ def sample_from_config(config_path: Path, *, cli_overrides: SampleCliOverrides |
             "model_run_name": run_name,
             "sample_run_name": sample_run_paths.sample_run_name,
         }
+        if request.size_distribution is not None:
+            resolved_cfg["sampling"]["size_distribution"] = {
+                "values": list(request.size_distribution.values),
+                "probabilities": list(request.size_distribution.probabilities),
+            }
         if request.animation is not None:
             resolved_cfg["sampling"]["animation"] = {
                 **(sampling_cfg.get("animation") or {}),
@@ -190,24 +242,43 @@ def sample_from_config(config_path: Path, *, cli_overrides: SampleCliOverrides |
             },
         )
 
+    sample_num_vertices = _resolve_sample_num_vertices(
+        checkpoint=checkpoint,
+        request_num_samples=request.num_samples,
+        model_type=model_type,
+        fallback_size=max_vertices,
+        requested_distribution=request.size_distribution,
+        seed=seed,
+    )
+    uniform_sample_size = int(sample_num_vertices[0]) if np.all(sample_num_vertices == sample_num_vertices[0]) else None
+
     guidance_grad = None
     if request.guidance.enabled:
+        if (
+            model_type != "mlp"
+            and request.guidance.kind in {"classifier", "regressor"}
+            and uniform_sample_size is None
+        ):
+            raise ValueError(
+                "checkpoint-backed classifier/regressor guidance requires a uniform polygon size batch; "
+                "use sampling.size_distribution with one size or switch to analytic guidance"
+            )
         _, guidance, guidance_n_vertices = load_sampling_guidance(
             request.guidance.checkpoint_path,
             device=device,
             kind=request.guidance.kind or "classifier",
             scale=request.guidance.scale,
-            n_vertices=n_vertices,
+            n_vertices=uniform_sample_size,
             target_class=request.guidance.target_class,
             target_value=request.guidance.target_value,
             alpha=request.guidance.alpha,
             beta=request.guidance.beta,
             gamma=request.guidance.gamma,
         )
-        if guidance_n_vertices != n_vertices:
+        if model_type == "mlp" and guidance_n_vertices != int(sample_num_vertices[0]):
             raise ValueError(
                 f"guidance model n_vertices={guidance_n_vertices} does not match "
-                f"diffusion checkpoint n_vertices={n_vertices}"
+                f"diffusion checkpoint n_vertices={int(sample_num_vertices[0])}"
             )
         guidance_grad = guidance
         guidance_desc = f"scale={request.guidance.scale}"
@@ -232,42 +303,90 @@ def sample_from_config(config_path: Path, *, cli_overrides: SampleCliOverrides |
             guidance_desc += ", objective=maximize_predicted_score"
         print(f"[sample] enabled {request.guidance.kind} guidance ({guidance_desc})")
 
-    if request.animation is None:
-        samples = diffusion.p_sample_loop(
-            (request.num_samples, n_vertices * 2),
-            n_steps=request.n_steps,
-            guidance_grad=guidance_grad,
-        )
-        trajectories = None
+    if model_type == "mlp":
+        fixed_n_vertices = int(sample_num_vertices[0])
+        if request.animation is None:
+            samples = diffusion.p_sample_loop(
+                (request.num_samples, fixed_n_vertices * 2),
+                n_steps=request.n_steps,
+                guidance_grad=guidance_grad,
+            )
+            trajectories = None
+        else:
+            samples, trajectories = diffusion.p_sample_loop_trajectories(
+                (request.num_samples, fixed_n_vertices * 2),
+                n_steps=request.n_steps,
+                trajectory_indices=animation_sample_indices(request.animation),
+                guidance_grad=guidance_grad,
+            )
+        graph_batch = None
     else:
-        samples, trajectories = diffusion.p_sample_loop_trajectories(
-            (request.num_samples, n_vertices * 2),
-            n_steps=request.n_steps,
-            trajectory_indices=animation_sample_indices(request.animation),
-            guidance_grad=guidance_grad,
-        )
+        if request.animation is None:
+            samples, graph_batch = diffusion.p_sample_loop_graph(
+                sample_num_vertices.tolist(),
+                n_steps=request.n_steps,
+                guidance_grad=guidance_grad,
+            )
+            trajectories = None
+        else:
+            samples, graph_batch, trajectories = diffusion.p_sample_loop_graph_trajectories(
+                sample_num_vertices.tolist(),
+                n_steps=request.n_steps,
+                trajectory_indices=animation_sample_indices(request.animation),
+                guidance_grad=guidance_grad,
+            )
 
-    samples = samples.detach().cpu().numpy().reshape(request.num_samples, n_vertices, 2).astype(np.float32)
-    np.savez_compressed(
-        request.out_path,
-        coords=samples,
-        n=np.int32(n_vertices),
-        meta=dict(
-            checkpoint=str(checkpoint_path),
-            run_name=run_name or None,
-            sample_run_name=None if sample_run_paths is None else sample_run_paths.sample_run_name,
-            num_samples=request.num_samples,
-            n_steps=request.n_steps,
-            checkpoint_n_steps=diffusion_config.n_steps,
-        ),
+    meta = dict(
+        checkpoint=str(checkpoint_path),
+        run_name=run_name or None,
+        sample_run_name=None if sample_run_paths is None else sample_run_paths.sample_run_name,
+        num_samples=request.num_samples,
+        n_steps=request.n_steps,
+        checkpoint_n_steps=diffusion_config.n_steps,
     )
+    if request.size_distribution is not None:
+        meta["requested_size_distribution"] = {
+            "values": list(request.size_distribution.values),
+            "probabilities": list(request.size_distribution.probabilities),
+        }
+
+    if graph_batch is None:
+        n_vertices = int(sample_num_vertices[0])
+        samples_np = samples.detach().cpu().numpy().reshape(request.num_samples, n_vertices, 2).astype(np.float32)
+        sample_num_vertices_np = np.full((request.num_samples,), n_vertices, dtype=np.int32)
+        np.savez_compressed(
+            request.out_path,
+            coords=samples_np,
+            n=np.int32(n_vertices),
+            meta=meta,
+        )
+    else:
+        sample_num_vertices_np = graph_batch.num_vertices.detach().cpu().numpy().astype(np.int32)
+        samples_raw = samples.detach().cpu().numpy().astype(np.float32)
+        if np.all(sample_num_vertices_np == sample_num_vertices_np[0]):
+            n_vertices = int(sample_num_vertices_np[0])
+            samples_np = samples_raw.reshape(request.num_samples, n_vertices, 2)
+            np.savez_compressed(
+                request.out_path,
+                coords=samples_np,
+                n=np.int32(n_vertices),
+                meta=meta,
+            )
+        else:
+            samples_np = samples_raw
+            np.savez_compressed(
+                request.out_path,
+                coords=samples_np,
+                num_vertices=sample_num_vertices_np,
+                meta=meta,
+            )
 
     print(
         f"[sample] saved {request.out_path} with {request.num_samples} samples "
         f"(sampling n_steps={request.n_steps}, checkpoint n_steps={diffusion_config.n_steps})"
     )
     if trajectories is not None and request.animation is not None:
-        animation_out_paths = save_animations(trajectories, n_vertices, request.animation)
+        animation_out_paths = save_animations(trajectories, None if graph_batch is not None else n_vertices, request.animation)
         print(
             f"[sample] saved {len(animation_out_paths)} animation(s) under {animation_out_paths[0].parent} "
             f"(start_index={request.animation.sample_index}, count={request.animation.count}, "
@@ -279,7 +398,8 @@ def sample_from_config(config_path: Path, *, cli_overrides: SampleCliOverrides |
         checkpoint_path=checkpoint_path,
         config_path=config_path,
         samples_out_path=request.out_path,
-        coords=samples,
+        coords=samples_np,
+        num_vertices=None if np.all(sample_num_vertices_np == sample_num_vertices_np[0]) else sample_num_vertices_np,
         options=request.diagnostics,
         sampling_n_steps=request.n_steps,
         sample_run_name=None if sample_run_paths is None else sample_run_paths.sample_run_name,

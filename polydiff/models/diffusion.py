@@ -8,6 +8,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 import torch
 import torch.nn as nn
 
+from ..data.polygon_dataset import PolygonGraphBatch, build_polygon_graph_batch
 from .gat import GAT
 from .gcn import GraphConvolution
 
@@ -56,6 +57,79 @@ class DenoiseMLP(nn.Module):
         h = torch.cat([x, emb], dim=1)                      # concatenate features: (B, data_dim + time_emb_dim)
         return self.net(h)                                  # predict eps_hat: (B, data_dim)
 
+
+def _graph_batch_from_dense_flattened(
+    x: torch.Tensor,
+    *,
+    expected_data_dim: int,
+    num_vertices: int,
+) -> tuple[PolygonGraphBatch, int]:
+    if x.ndim != 2 or x.shape[1] != expected_data_dim:
+        raise ValueError(f"x must have shape (batch, {expected_data_dim}), got {tuple(x.shape)}")
+    batch_size = x.shape[0]
+    coords = x.reshape(batch_size * num_vertices, 2)
+    graph_batch = build_polygon_graph_batch(
+        torch.full((batch_size,), num_vertices, dtype=torch.long, device=x.device),
+        coords=coords,
+    )
+    return graph_batch, batch_size
+
+
+def _graph_batch_mean(node_features: torch.Tensor, batch: PolygonGraphBatch) -> torch.Tensor:
+    sums = torch.zeros(
+        (batch.batch_size, node_features.shape[1]),
+        dtype=node_features.dtype,
+        device=node_features.device,
+    )
+    sums.index_add_(0, batch.graph_index, node_features)
+    counts = batch.num_vertices.to(node_features.dtype).unsqueeze(1).clamp_min(1.0)
+    return sums / counts
+
+
+def _cycle_positional_features(batch: PolygonGraphBatch, *, dtype: torch.dtype) -> torch.Tensor:
+    num_vertices_per_node = batch.num_vertices.index_select(0, batch.graph_index).to(dtype)
+    node_index = batch.node_index.to(dtype)
+    phase = node_index * (2.0 * torch.pi / num_vertices_per_node)
+    return torch.stack(
+        [
+            torch.sin(phase),
+            torch.cos(phase),
+            torch.sin(2.0 * phase),
+            torch.cos(2.0 * phase),
+        ],
+        dim=1,
+    )
+
+
+def _cycle_edge_index(batch: PolygonGraphBatch) -> torch.Tensor:
+    total_vertices = batch.total_vertices
+    if total_vertices == 0:
+        return torch.empty((2, 0), dtype=torch.long, device=batch.coords.device)
+    src = torch.arange(total_vertices, device=batch.coords.device, dtype=torch.long)
+    offsets = batch.ptr[:-1].index_select(0, batch.graph_index)
+    counts = batch.num_vertices.index_select(0, batch.graph_index)
+    next_nodes = offsets + torch.remainder(batch.node_index + 1, counts)
+    prev_nodes = offsets + torch.remainder(batch.node_index - 1, counts)
+    return torch.stack(
+        [
+            torch.cat([src, src, src], dim=0),
+            torch.cat([next_nodes, prev_nodes, src], dim=0),
+        ],
+        dim=0,
+    )
+
+
+def _cycle_adj(batch: PolygonGraphBatch, *, device: torch.device) -> torch.Tensor:
+    indices = _cycle_edge_index(batch)
+    values = torch.full((indices.shape[1],), 1.0 / 3.0, dtype=torch.float32, device=device)
+    return torch.sparse_coo_tensor(
+        indices,
+        values,
+        size=(batch.total_vertices, batch.total_vertices),
+        device=device,
+    ).coalesce()
+
+
 class DenoiseGAT(nn.Module):
     def __init__(
         self,
@@ -82,11 +156,6 @@ class DenoiseGAT(nn.Module):
             SinusoidalPosEmb(time_emb_dim),
             nn.Linear(time_emb_dim, time_emb_dim),
             nn.SiLU(),
-        )
-        self.register_buffer(
-            "vertex_positional_features",
-            self._build_cycle_positional_features(self.num_vertices),
-            persistent=False,
         )
 
         node_in_dim = self.coord_dim + self.pos_enc_dim + time_emb_dim
@@ -123,123 +192,54 @@ class DenoiseGAT(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, self.coord_dim),
         )
-        self.register_buffer("base_edge_index", self._build_cycle_edge_index(self.num_vertices), persistent=False)
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        *,
+        batch: PolygonGraphBatch | None = None,
+    ) -> torch.Tensor:
+        if batch is None:
+            graph_batch, batch_size = _graph_batch_from_dense_flattened(
+                x,
+                expected_data_dim=self.data_dim,
+                num_vertices=self.num_vertices,
+            )
+            return_dense = True
+            coords = graph_batch.coords
+        else:
+            graph_batch = batch
+            batch_size = graph_batch.batch_size
+            return_dense = False
+            if x.ndim != 2 or x.shape != (graph_batch.total_vertices, self.coord_dim):
+                raise ValueError(
+                    f"x must have shape ({graph_batch.total_vertices}, {self.coord_dim}), got {tuple(x.shape)}"
+                )
+            coords = x
 
-    @staticmethod
-    def _build_cycle_edge_index(num_vertices: int) -> torch.Tensor:
-        nodes = torch.arange(num_vertices, dtype=torch.long)
-        next_nodes = torch.roll(nodes, shifts=-1)
-        prev_nodes = torch.roll(nodes, shifts=1)
-        return torch.stack(
-            [
-                torch.cat([nodes, nodes, nodes], dim=0),
-                torch.cat([next_nodes, prev_nodes, nodes], dim=0),
-            ],
-            dim=0,
-        )
+        if t.ndim != 1 or t.shape[0] != batch_size:
+            raise ValueError(f"t must have shape ({batch_size},), got {tuple(t.shape)}")
 
-    @staticmethod
-    def _build_cycle_positional_features(num_vertices: int) -> torch.Tensor:
-        phase = torch.arange(num_vertices, dtype=torch.float32) * (2.0 * torch.pi / num_vertices)
-        return torch.stack(
-            [
-                torch.sin(phase),
-                torch.cos(phase),
-                torch.sin(2.0 * phase),
-                torch.cos(2.0 * phase),
-            ],
-            dim=1,
-        )
-
-    def _batched_edge_index(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        edge_index = self.base_edge_index.to(device)
-        num_edges = edge_index.shape[1]
-        offsets = (
-            torch.arange(batch_size, device=device, dtype=edge_index.dtype)
-            .repeat_interleave(num_edges)
-            .mul(self.num_vertices)
-        )
-        return edge_index.repeat(1, batch_size) + offsets.unsqueeze(0)
-
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        if x.ndim != 2 or x.shape[1] != self.data_dim:
-            raise ValueError(f"x must have shape (batch, {self.data_dim}), got {tuple(x.shape)}")
-        if t.ndim != 1 or t.shape[0] != x.shape[0]:
-            raise ValueError(f"t must have shape ({x.shape[0]},), got {tuple(t.shape)}")
-
-
-        batch_size = x.shape[0]
-        # shape: scalar int
-        # meaning: number of polygons in the batch
-        # call it B
-
-        coords = x.reshape(batch_size, self.num_vertices, self.coord_dim)
-        # shape: (B, V, 2)
-        # meaning: turn each flattened polygon back into V vertices with 2 coordinates each
-        # so coords[b, i] is the (x, y) pair for vertex i of polygon b
-
-        time_emb = self.time_mlp(t).unsqueeze(1).expand(-1, self.num_vertices, -1)
-        # self.time_mlp(t): (B, T)
-        # unsqueeze(1):     (B, 1, T)
-        # expand(...):      (B, V, T)
-        # meaning: compute one timestep embedding per polygon, then copy it to every vertex
-        # so all vertices in the same polygon get the same diffusion-time context
-
-        pos_enc = self.vertex_positional_features.to(x.device).unsqueeze(0).expand(batch_size, -1, -1)
-        # self.vertex_positional_features: (V, P) = (V, 4)
-        # unsqueeze(0):                    (1, V, P)
-        # expand(...):                     (B, V, P)
-        # meaning: give each vertex a fixed "where am I on the ring?" encoding
-        # this is the sin/cos cycle-position info, copied across the batch
-
-        node_features = torch.cat([coords, pos_enc, time_emb], dim=-1).reshape(batch_size * self.num_vertices, -1)
-        # before reshape:
-        #   coords:      (B, V, 2)
-        #   pos_enc:     (B, V, P)
-        #   time_emb:    (B, V, T)
-        # cat dim=-1 ->  (B, V, 2 + P + T)
-        #
-        # after reshape:
-        #   (B * V, 2 + P + T)
-        #
-        # meaning: each row is now one vertex from one polygon
-        # all batch polygons are flattened into one big list of nodes
-
-        edge_index = self._batched_edge_index(batch_size, x.device)
-        # shape: (2, E_total)
-        # meaning: graph connectivity for the whole batch
-        # this is not one connected giant graph in the semantic sense
-        # it is a disjoint union of B separate cycle graphs, one per polygon
+        time_emb = self.time_mlp(t).index_select(0, graph_batch.graph_index)
+        pos_enc = _cycle_positional_features(graph_batch, dtype=coords.dtype)
+        node_features = torch.cat([coords, pos_enc, time_emb], dim=1)
+        edge_index = _cycle_edge_index(graph_batch)
 
         node_hidden, _ = self.gat((node_features, edge_index))
-        # input node_features: (B * V, 2 + P + T)
-        # output node_hidden:  (B * V, H)
-        # meaning: GAT computes one hidden embedding per vertex
-        # each row now represents one vertex after message passing with neighbors
-
-        node_hidden = node_hidden.reshape(batch_size, self.num_vertices, -1)
-        # shape: (B, V, H)
-        # meaning: restore the batch structure
-        # node_hidden[b, i] is the hidden vector for vertex i in polygon b
-
         if self.use_global_features:
-            global_features = self.global_head(node_hidden.mean(dim=1))
-            global_features = global_features.unsqueeze(1).expand(-1, self.num_vertices, -1)
-            global_gate = self.global_gate(torch.cat([node_hidden, global_features], dim=-1))
-            node_readout = torch.cat([node_hidden, global_gate * global_features], dim=-1)
+            global_features = self.global_head(_graph_batch_mean(node_hidden, graph_batch))
+            global_nodes = global_features.index_select(0, graph_batch.graph_index)
+            global_gate = self.global_gate(torch.cat([node_hidden, global_nodes], dim=1))
+            node_readout = torch.cat([node_hidden, global_gate * global_nodes], dim=1)
         else:
             node_readout = node_hidden
 
-        node_noise = self.node_head(node_readout.reshape(batch_size * self.num_vertices, -1))
-        # node_hidden.reshape(...): (B * V, H)
-        # self.node_head output:    (B * V, 2)
-        # meaning: predict a 2D noise vector for each vertex independently from its hidden embedding
-        # so each row is the predicted (delta_x_noise, delta_y_noise) for one vertex
+        node_noise = self.node_head(node_readout)
+        if return_dense:
+            return node_noise.reshape(batch_size, self.data_dim)
+        return node_noise
 
-        return node_noise.reshape(batch_size, self.data_dim)
-        # node_noise before reshape: (B * V, 2)
-        # after reshape:             (B, 2 * V) = (B, data_dim)
-        # meaning: flatten per-vertex predictions back into the same format as the input/output diffusion tensors
+
 class DenoiseGCN(nn.Module):
     def __init__(
         self,
@@ -296,67 +296,55 @@ class DenoiseGCN(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, self.coord_dim),
         )
-        self.register_buffer("base_adj_indices", self._build_cycle_adj_indices(self.num_vertices), persistent=False)
-        self.register_buffer(
-            "base_adj_values",
-            torch.full((self.base_adj_indices.shape[1],), 1.0 / 3.0, dtype=torch.float32),
-            persistent=False,
-        )
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        *,
+        batch: PolygonGraphBatch | None = None,
+    ) -> torch.Tensor:
+        if batch is None:
+            graph_batch, batch_size = _graph_batch_from_dense_flattened(
+                x,
+                expected_data_dim=self.data_dim,
+                num_vertices=self.num_vertices,
+            )
+            return_dense = True
+            coords = graph_batch.coords
+        else:
+            graph_batch = batch
+            batch_size = graph_batch.batch_size
+            return_dense = False
+            if x.ndim != 2 or x.shape != (graph_batch.total_vertices, self.coord_dim):
+                raise ValueError(
+                    f"x must have shape ({graph_batch.total_vertices}, {self.coord_dim}), got {tuple(x.shape)}"
+                )
+            coords = x
 
-    @staticmethod
-    def _build_cycle_adj_indices(num_vertices: int) -> torch.Tensor:
-        nodes = torch.arange(num_vertices, dtype=torch.long)
-        next_nodes = torch.roll(nodes, shifts=-1)
-        prev_nodes = torch.roll(nodes, shifts=1)
-        return torch.stack(
-            [
-                torch.cat([nodes, nodes, nodes], dim=0),
-                torch.cat([nodes, next_nodes, prev_nodes], dim=0),
-            ],
-            dim=0,
-        )
+        if t.ndim != 1 or t.shape[0] != batch_size:
+            raise ValueError(f"t must have shape ({batch_size},), got {tuple(t.shape)}")
 
-    def _batched_adj(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        base_indices = self.base_adj_indices.to(device)
-        num_edges = base_indices.shape[1]
-        offsets = (
-            torch.arange(batch_size, device=device, dtype=base_indices.dtype)
-            .repeat_interleave(num_edges)
-            .mul(self.num_vertices)
-        )
-        indices = base_indices.repeat(1, batch_size) + offsets.unsqueeze(0)
-        values = self.base_adj_values.to(device).repeat(batch_size)
-        size = (batch_size * self.num_vertices, batch_size * self.num_vertices)
-        return torch.sparse_coo_tensor(indices, values, size=size, device=device).coalesce()
-
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        if x.ndim != 2 or x.shape[1] != self.data_dim:
-            raise ValueError(f"x must have shape (batch, {self.data_dim}), got {tuple(x.shape)}")
-        if t.ndim != 1 or t.shape[0] != x.shape[0]:
-            raise ValueError(f"t must have shape ({x.shape[0]},), got {tuple(t.shape)}")
-
-        batch_size = x.shape[0]
-        coords = x.reshape(batch_size, self.num_vertices, self.coord_dim)
-        time_emb = self.time_mlp(t).unsqueeze(1).expand(-1, self.num_vertices, -1)
-        h = torch.cat([coords, time_emb], dim=-1).reshape(batch_size * self.num_vertices, -1)
-        adj = self._batched_adj(batch_size, x.device)
+        time_emb = self.time_mlp(t).index_select(0, graph_batch.graph_index)
+        h = torch.cat([coords, time_emb], dim=1)
+        adj = _cycle_adj(graph_batch, device=coords.device)
 
         for i, layer in enumerate(self.layers):
             residual = self.residual_projs[i](h)
             h = layer(h, adj) + residual
             h = self.activation(h)
 
-        node_hidden = h.reshape(batch_size, self.num_vertices, -1)
         if self.use_global_features:
-            global_features = self.global_head(node_hidden.mean(dim=1))
-            global_features = global_features.unsqueeze(1).expand(-1, self.num_vertices, -1)
-            global_gate = self.global_gate(torch.cat([node_hidden, global_features], dim=-1))
-            node_readout = torch.cat([node_hidden, global_gate * global_features], dim=-1)
+            global_features = self.global_head(_graph_batch_mean(h, graph_batch))
+            global_nodes = global_features.index_select(0, graph_batch.graph_index)
+            global_gate = self.global_gate(torch.cat([h, global_nodes], dim=1))
+            node_readout = torch.cat([h, global_gate * global_nodes], dim=1)
         else:
-            node_readout = node_hidden
+            node_readout = h
 
-        node_noise = self.node_head(node_readout.reshape(batch_size * self.num_vertices, -1))
-        return node_noise.reshape(batch_size, self.data_dim)
+        node_noise = self.node_head(node_readout)
+        if return_dense:
+            return node_noise.reshape(batch_size, self.data_dim)
+        return node_noise
 
 
 def build_denoiser(*, data_dim: int, model_cfg: Mapping[str, Any] | None = None) -> nn.Module:
@@ -401,7 +389,7 @@ class DiffusionConfig:
     beta_end: float = 2e-2
 
 
-GuidanceGradFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+GuidanceGradFn = Callable[..., torch.Tensor]
 
 
 class Diffusion:
@@ -452,16 +440,36 @@ class Diffusion:
             raise ValueError(f"n_steps must be in [1, {self.config.n_steps}], got {steps}")
         return steps
 
-    def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+    def q_sample(
+        self,
+        x0: torch.Tensor,
+        t: torch.Tensor,
+        noise: torch.Tensor,
+        *,
+        graph_batch: PolygonGraphBatch | None = None,
+    ) -> torch.Tensor:
         """Forward diffusion (adding noise). Create x_t in in one shot"""
-        sqrt_ab = self.sqrt_alphas_cumprod[t].unsqueeze(1)              # gather sqrt(ᾱ_t) per sample, shape (B,1)
-        sqrt_omab = self.sqrt_one_minus_alphas_cumprod[t].unsqueeze(1)  # gather sqrt(1-ᾱ_t) per sample, shape (B,1)
+        if graph_batch is None:
+            sqrt_ab = self.sqrt_alphas_cumprod[t].unsqueeze(1)              # gather sqrt(ᾱ_t) per sample, shape (B,1)
+            sqrt_omab = self.sqrt_one_minus_alphas_cumprod[t].unsqueeze(1)  # gather sqrt(1-ᾱ_t) per sample, shape (B,1)
+        else:
+            node_t = t.index_select(0, graph_batch.graph_index)
+            sqrt_ab = self.sqrt_alphas_cumprod[node_t].unsqueeze(1)
+            sqrt_omab = self.sqrt_one_minus_alphas_cumprod[node_t].unsqueeze(1)
         
         # x_t = sqrt(ᾱ_t) * x_0 + sqrt(1-ᾱ_t) * ε
         return sqrt_ab * x0 + sqrt_omab * noise
 
-    def predict_eps(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        return self.model(x_t, t) # eps_hat = model(x_t, t)
+    def predict_eps(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        *,
+        graph_batch: PolygonGraphBatch | None = None,
+    ) -> torch.Tensor:
+        if graph_batch is None:
+            return self.model(x_t, t)  # eps_hat = model(x_t, t)
+        return self.model(x_t, t, batch=graph_batch)
 
     def p_sample(
         self,
@@ -469,21 +477,30 @@ class Diffusion:
         t: torch.Tensor,
         *,
         guidance_grad: GuidanceGradFn | None = None,
+        graph_batch: PolygonGraphBatch | None = None,
     ) -> torch.Tensor:
         """Reverse diffusion step: sample x_{t-1} from learned p(x_{t-1} | x_t)."""
-        betas_t = self.betas[t].unsqueeze(1)                        # gather β_t per sample, shape (B,1)
-        sqrt_recip_alpha_t = self.sqrt_recip_alphas[t].unsqueeze(1) # gather sqrt(1/α_t) per sample, shape (B,1)
-        sqrt_omab_t = self.sqrt_one_minus_alphas_cumprod[t].unsqueeze(1) # gather sqrt(1-ᾱ_t), shape (B,1)
-        posterior_var_t = self.posterior_variance[t].unsqueeze(1)   # gather β̃_t per sample, shape (B,1)
+        if graph_batch is None:
+            effective_t = t
+        else:
+            effective_t = t.index_select(0, graph_batch.graph_index)
 
-        eps_pred = self.predict_eps(x_t, t)                         # model predicts ε_hat(x_t, t)
+        betas_t = self.betas[effective_t].unsqueeze(1)                        # gather β_t per sample, shape (...,1)
+        sqrt_recip_alpha_t = self.sqrt_recip_alphas[effective_t].unsqueeze(1) # gather sqrt(1/α_t), shape (...,1)
+        sqrt_omab_t = self.sqrt_one_minus_alphas_cumprod[effective_t].unsqueeze(1) # gather sqrt(1-ᾱ_t), shape (...,1)
+        posterior_var_t = self.posterior_variance[effective_t].unsqueeze(1)   # gather β̃_t per sample, shape (...,1)
+
+        eps_pred = self.predict_eps(x_t, t, graph_batch=graph_batch)                         # model predicts ε_hat(x_t, t)
         
         # DDPM mean:
         # μθ(x_t,t) = (1/sqrt(α_t)) * (x_t - (β_t / sqrt(1-ᾱ_t)) * ε_hat)
         model_mean = sqrt_recip_alpha_t * (x_t - betas_t * eps_pred / sqrt_omab_t)
 
         if guidance_grad is not None:
-            grad = guidance_grad(x_t, t)
+            if graph_batch is None:
+                grad = guidance_grad(x_t, t)
+            else:
+                grad = guidance_grad(x_t, t, graph_batch=graph_batch)
             if grad.shape != x_t.shape:
                 raise ValueError(
                     f"guidance_grad must return shape {tuple(x_t.shape)}, got {tuple(grad.shape)}"
@@ -514,7 +531,7 @@ class Diffusion:
             tracked_indices = [int(idx) for idx in trajectory_indices]
             for idx in tracked_indices:
                 if not 0 <= idx < shape[0]:
-                    raise ValueError(f"trajectory index must be in [0, {shape[0] - 1}], got {idx}")
+                    raise ValueError(f"trajectory_index must be in [0, {shape[0] - 1}], got {idx}")
 
         self.model.eval()
         with torch.no_grad():
@@ -532,6 +549,43 @@ class Diffusion:
             return x, None
         return x, torch.stack(trajectory, dim=0)
 
+    def _sample_graph_loop(
+        self,
+        graph_batch: PolygonGraphBatch,
+        *,
+        steps: int,
+        trajectory_indices: Sequence[int] | None = None,
+        guidance_grad: GuidanceGradFn | None = None,
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+        tracked_indices: list[int] | None = None
+        if trajectory_indices is not None:
+            tracked_indices = [int(idx) for idx in trajectory_indices]
+            for idx in tracked_indices:
+                if not 0 <= idx < graph_batch.batch_size:
+                    raise ValueError(
+                        f"trajectory_index must be in [0, {graph_batch.batch_size - 1}], got {idx}"
+                    )
+
+        self.model.eval()
+        with torch.no_grad():
+            x = torch.randn((graph_batch.total_vertices, 2), device=self.device)
+            trajectories = None
+            if tracked_indices is not None:
+                trajectories = [[] for _ in tracked_indices]
+                for list_index, graph_index in enumerate(tracked_indices):
+                    trajectories[list_index].append(x[graph_batch.graph_slice(graph_index)].detach().cpu().clone())
+
+            for step in reversed(range(steps)):
+                t = torch.full((graph_batch.batch_size,), step, device=self.device, dtype=torch.long)
+                x = self.p_sample(x, t, guidance_grad=guidance_grad, graph_batch=graph_batch)
+                if trajectories is not None:
+                    for list_index, graph_index in enumerate(tracked_indices):
+                        trajectories[list_index].append(x[graph_batch.graph_slice(graph_index)].detach().cpu().clone())
+
+        if trajectories is None:
+            return x, None
+        return x, [torch.stack(trajectory, dim=0) for trajectory in trajectories]
+
     def p_sample_loop(
         self,
         shape: tuple[int, int],
@@ -543,6 +597,18 @@ class Diffusion:
         steps = self._resolve_n_steps(n_steps)
         x, _ = self._sample_loop(shape, steps=steps, guidance_grad=guidance_grad)
         return x                                            # final x is a generated sample (approx x_0)
+
+    def p_sample_loop_graph(
+        self,
+        num_vertices: torch.Tensor | Sequence[int],
+        *,
+        n_steps: Optional[int] = None,
+        guidance_grad: GuidanceGradFn | None = None,
+    ) -> tuple[torch.Tensor, PolygonGraphBatch]:
+        steps = self._resolve_n_steps(n_steps)
+        graph_batch = build_polygon_graph_batch(num_vertices, device=self.device)
+        x, _ = self._sample_graph_loop(graph_batch, steps=steps, guidance_grad=guidance_grad)
+        return x, graph_batch
 
     def p_sample_loop_trajectory(
         self,
@@ -579,23 +645,54 @@ class Diffusion:
             raise RuntimeError("trajectory capture unexpectedly returned no trajectories")
         return x, trajectories
 
-    def loss(self, x0: torch.Tensor, *, return_stats: bool = False) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
+    def p_sample_loop_graph_trajectories(
+        self,
+        num_vertices: torch.Tensor | Sequence[int],
+        *,
+        n_steps: Optional[int] = None,
+        trajectory_indices: Sequence[int],
+        guidance_grad: GuidanceGradFn | None = None,
+    ) -> tuple[torch.Tensor, PolygonGraphBatch, list[torch.Tensor]]:
+        steps = self._resolve_n_steps(n_steps)
+        graph_batch = build_polygon_graph_batch(num_vertices, device=self.device)
+        x, trajectories = self._sample_graph_loop(
+            graph_batch,
+            steps=steps,
+            trajectory_indices=trajectory_indices,
+            guidance_grad=guidance_grad,
+        )
+        if trajectories is None:
+            raise RuntimeError("trajectory capture unexpectedly returned no trajectories")
+        return x, graph_batch, trajectories
+
+    def loss(
+        self,
+        x0: torch.Tensor,
+        *,
+        graph_batch: PolygonGraphBatch | None = None,
+        return_stats: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
         """Training loss: predict the noise used to create x_t from x_0."""
-        b = x0.shape[0]     # batch size B
+        b = graph_batch.batch_size if graph_batch is not None else x0.shape[0]     # batch size B
         
         # sample t ~ Uniform{0,...,T-1} independently for each batch element
         t = torch.randint(0, self.config.n_steps, (b,), device=self.device, dtype=torch.long)
         noise = torch.randn_like(x0)        # sample ε ~ N(0,I) same shape as x0
-        x_t = self.q_sample(x0, t, noise)   # create noisy inputs x_t from x0 and ε
-        eps_pred = self.predict_eps(x_t, t) # predict ε_hat(x_t, t)
+        x_t = self.q_sample(x0, t, noise, graph_batch=graph_batch)   # create noisy inputs x_t from x0 and ε
+        eps_pred = self.predict_eps(x_t, t, graph_batch=graph_batch) # predict ε_hat(x_t, t)
         
         # minimize mean squared error: ||ε_hat - ε||^2
         loss = nn.functional.mse_loss(eps_pred, noise)
         if not return_stats:
             return loss
 
-        sqrt_ab = self.sqrt_alphas_cumprod[t].unsqueeze(1)
-        sqrt_omab = self.sqrt_one_minus_alphas_cumprod[t].unsqueeze(1)
+        if graph_batch is None:
+            sqrt_ab = self.sqrt_alphas_cumprod[t].unsqueeze(1)
+            sqrt_omab = self.sqrt_one_minus_alphas_cumprod[t].unsqueeze(1)
+        else:
+            node_t = t.index_select(0, graph_batch.graph_index)
+            sqrt_ab = self.sqrt_alphas_cumprod[node_t].unsqueeze(1)
+            sqrt_omab = self.sqrt_one_minus_alphas_cumprod[node_t].unsqueeze(1)
         x0_pred = (x_t - sqrt_omab * eps_pred) / sqrt_ab.clamp_min(1e-8)
 
         stats = {

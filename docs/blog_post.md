@@ -1,5 +1,7 @@
 # From Noise to Geometry: Training a Diffusion Model to Draw Polygons
 
+> Update: this post describes the original fixed-size hexagon baseline. The current codebase also supports variable-size polygon generation for `gat` and `gcn` using ragged graph batches without padded storage.
+
 What if you could start with pure Gaussian noise and end up with clean, plausible geometry? That is exactly what I’m building in this project: a diffusion model that learns a distribution over 2D polygons and then generates new polygon shapes from scratch.
 
 This is compelling to me for two reasons. First, it is a clean sandbox for understanding generative modeling mechanics without the overhead of images or huge datasets. Second, polygon generation is still actually useful: synthetic geometric data supports simulation, CAD-style workflows, shape priors, and future conditioning tasks where we care about controllable structure.

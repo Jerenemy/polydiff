@@ -13,6 +13,12 @@ sampling:
   num_samples: 10000 #64
   # Optional inference-time override (must be <= checkpoint diffusion.n_steps)
   # n_steps: 25
+  # Optional polygon-size prior. If omitted, GAT/GCN checkpoints default to the
+  # empirical training-set histogram stored in the checkpoint metadata.
+  # For MLP checkpoints this must stay fixed at the checkpoint's n_vertices.
+  # size_distribution:
+  #   values: [5, 6, 7, 8]
+  #   probabilities: [0.1, 0.2, 0.4, 0.3]
   # Optional explicit sample output path. By default this becomes:
   # data/processed/<run_name>/sample_0001__.../samples.npz
   # out_path: "data/processed/custom_samples.npz"

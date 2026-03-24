@@ -2,6 +2,7 @@ import numpy as np
 
 from polydiff.data.gen_polygons import (
     batch,
+    batch_variable_sizes,
     make_polygon,
     polygon_signed_area_xy,
     regularity_score,
@@ -31,3 +32,20 @@ def test_batch_shapes():
     assert np.all(score <= 1.0)
     assert np.all(deform >= 0.0)
     assert np.all(deform <= 1.0)
+
+
+def test_batch_variable_sizes_returns_ragged_storage():
+    coords, num_vertices, score, deform = batch_variable_sizes(
+        size_values=[5, 7],
+        size_probabilities=[0.25, 0.75],
+        num=12,
+        seed=123,
+    )
+
+    assert coords.ndim == 2
+    assert coords.shape[1] == 2
+    assert num_vertices.shape == (12,)
+    assert coords.shape[0] == int(num_vertices.sum())
+    assert set(np.unique(num_vertices).tolist()).issubset({5, 7})
+    assert score.shape == (12,)
+    assert deform.shape == (12,)

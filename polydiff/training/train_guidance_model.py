@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from .. import paths
 from ..data.gen_polygons import regularity_score
+from ..data.polygon_dataset import load_polygon_dataset
 from ..models.guidance_models import build_guidance_model
 from ..models.diffusion import Diffusion, DiffusionConfig
 from ..utils.runtime import device_from_config, load_yaml_config, resolve_project_path, set_seed
@@ -77,9 +78,12 @@ def train_guidance_model_from_config(config_path: Path) -> None:
         beta_end=float(diffusion_cfg.get("beta_end", 2e-2)),
     )
 
+    polygon_data = load_polygon_dataset(data_path)
+    if not polygon_data.is_uniform:
+        raise ValueError("guidance-model training currently supports fixed-size polygon datasets only")
     npz_data = np.load(data_path, allow_pickle=True)
-    coords = np.asarray(npz_data["coords"], dtype=np.float32)
-    n_vertices = int(npz_data["n"]) if "n" in npz_data else int(coords.shape[1])
+    coords = polygon_data.to_dense()
+    n_vertices = int(polygon_data.num_vertices[0])
     x = coords.reshape(coords.shape[0], -1)
     scores = _load_scores(coords, npz_data)
 

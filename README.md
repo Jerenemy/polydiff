@@ -1,12 +1,19 @@
 # Polydiff
 
-DDPM diffusion models for generating 2D polygons. The repo now supports multiple denoisers behind the same training and sampling pipeline:
+DDPM diffusion models for generating 2D polygons.
 
-- `mlp`: a flattened-vector baseline
-- `gat`: a graph attention denoiser over the polygon cycle graph
-- `gcn`: a simple graph convolution denoiser over the same cycle graph
+The repo supports three denoisers behind one training and sampling pipeline:
 
-The code is organized so data generation, model selection, training, sampling, and diagnostics can all be changed independently.
+- `mlp`: fixed-size flattened-vector baseline
+- `gat`: graph attention denoiser over the polygon cycle graph
+- `gcn`: graph convolution denoiser over the same cycle graph
+
+The important new split is:
+
+- `mlp` still requires a fixed number of vertices
+- `gat` and `gcn` now support both fixed-size and variable-size polygons without padded storage
+
+Variable-size polygon data is stored raggedly as concatenated `coords` plus a per-polygon `num_vertices` array. During training and sampling, GAT/GCN batches are built as concatenated node sets with per-graph sizes, so message passing operates on the natural polygon graphs rather than masked dense tensors.
 
 ## Structure
 
@@ -18,6 +25,12 @@ The code is organized so data generation, model selection, training, sampling, a
 - `pretrained_models/`: externally trained checkpoints
 - `notebooks/`: exploratory analysis
 - `tests/`: pytest tests
+
+## Variable-Size GNN Pipeline
+
+For the full design and file-format details of the new ragged GAT/GCN path, see:
+
+- [`docs/variable_size_pipeline.md`](docs/variable_size_pipeline.md)
 
 ## Quick Start
 
@@ -33,6 +46,16 @@ pip install -e .[dev]
 
 ```bash
 python -m polydiff.data.gen_polygons --n 6 --num 10000 --out hexagons.npz
+```
+
+Variable-size example:
+
+```bash
+python -m polydiff.data.gen_polygons \
+  --size_values 5,6,7,8 \
+  --size_probabilities 0.1,0.2,0.4,0.3 \
+  --num 10000 \
+  --out mixed_polygons.npz
 ```
 
 Important details about the generated data:
@@ -60,6 +83,13 @@ python -m polydiff.data.gen_polygons \
 python -m polydiff.data.gen_polygons \
   --n 6 --num 10000 --out hexagons_noisy.npz \
   --radial_sigma 0.30 --angle_sigma 0.20 --smooth_passes 1 --deform_dist uniform
+
+# variable-size mixture
+python -m polydiff.data.gen_polygons \
+  --size_values 5,6,7,8 \
+  --size_probabilities 0.1,0.2,0.4,0.3 \
+  --num 10000 --out mixed_noisy.npz \
+  --radial_sigma 0.30 --angle_sigma 0.20 --smooth_passes 1 --deform_dist uniform
 ```
 
 3. Plot polygons
@@ -76,7 +106,7 @@ Notes:
 4. Run tests
 
 ```bash
-pytest
+.venv/bin/pytest
 ```
 
 ## Training
@@ -95,6 +125,13 @@ model:
   num_layers: 3
 ```
 
+Architecture/data compatibility:
+
+- `mlp`: fixed-size datasets only
+- `gat` / `gcn`: fixed-size dense datasets and variable-size ragged datasets
+
+For variable-size GAT/GCN training, batches are collated as graph-native ragged node lists instead of padded `(B, V_max, 2)` tensors.
+
 Training writes:
 
 - `models/run_####__.../train.log`: human-readable logs
@@ -109,7 +146,9 @@ Checkpoints store:
 - model weights
 - diffusion schedule
 - `model_cfg`
-- `n_vertices`
+- `n_vertices` for fixed-size runs
+- `max_vertices` for GAT/GCN checkpoint reconstruction
+- training vertex-count histogram inside the training-data summary
 - `run_name`
 - training data path
 - training data summary statistics
@@ -133,9 +172,10 @@ Optional expensive generative diagnostics can be enabled during training with `t
 
 Relevant files:
 
-- [`configs/train_diffusion.yaml`](configs/train_diffusion.yaml) lines 12-16 define `model.type`, `hidden_dim`, `time_emb_dim`, and `num_layers`.
-- [`polydiff/training/train.py`](polydiff/training/train.py) lines 52-54 read `model_cfg` and call `build_denoiser(...)`.
-- [`polydiff/models/diffusion.py`](polydiff/models/diffusion.py) lines 260-288 dispatch `mlp`, `gat`, or `gcn`.
+- [`configs/train_diffusion.yaml`](configs/train_diffusion.yaml)
+- [`polydiff/training/train.py`](polydiff/training/train.py)
+- [`polydiff/models/diffusion.py`](polydiff/models/diffusion.py)
+- [`polydiff/data/polygon_dataset.py`](polydiff/data/polygon_dataset.py)
 
 ## Sampling
 
@@ -158,6 +198,22 @@ model:
   # run: "run_0007__..."
 ```
 
+Variable-size GAT/GCN sampling is controlled by `sampling.size_distribution`:
+
+```yaml
+sampling:
+  num_samples: 10000
+  size_distribution:
+    values: [5, 6, 7, 8]
+    probabilities: [0.1, 0.2, 0.4, 0.3]
+```
+
+Sampling behavior by model family:
+
+- `mlp`: always samples one fixed size matching the checkpoint
+- `gat` / `gcn`: if `size_distribution` is omitted, sampling defaults to the empirical training-size histogram stored in the checkpoint
+- sampled polygon size stays fixed for each sample throughout the reverse diffusion trajectory
+
 Sampling writes into a numbered sampling subfolder under the model run:
 
 - `data/processed/run_####__.../sample_0001__.../samples.npz`
@@ -169,12 +225,18 @@ If you sample from the same model run multiple times, each invocation gets a new
 
 The diagnostics JSON compares generated samples against the training reference distribution when that reference is available from the checkpoint or explicitly configured.
 
+Sample file formats:
+
+- fixed-size output: dense `coords` with shape `(num_polygons, n_vertices, 2)` plus scalar `n`
+- variable-size output: ragged `coords` with shape `(total_vertices, 2)` plus per-polygon `num_vertices`
+
 Reduced-step sampling is supported with `sampling.n_steps`, but the current implementation uses naive schedule truncation rather than a respaced sampler. For architecture comparisons, full-step sampling is the cleanest reference.
 
 Relevant files:
 
-- [`configs/sample_diffusion.yaml`](configs/sample_diffusion.yaml) lines 6-13 define checkpoint loading and sampling options.
-- [`polydiff/sampling/runtime.py`](polydiff/sampling/runtime.py) lines 50-70 rebuild the denoiser from the checkpoint's stored `model_cfg`.
+- [`configs/sample_diffusion.yaml`](configs/sample_diffusion.yaml)
+- [`polydiff/sampling/sample.py`](polydiff/sampling/sample.py)
+- [`polydiff/sampling/runtime.py`](polydiff/sampling/runtime.py)
 
 ## Guidance
 
@@ -186,7 +248,7 @@ Intuition:
 - the guidance model says which direction in polygon-space looks more desirable
 - sampling combines both signals
 
-The guidance hook lives inside the reverse DDPM step. In [`polydiff/models/diffusion.py`](polydiff/models/diffusion.py) lines 421-457, `p_sample(...)` computes the usual reverse mean and then, if a guidance callback is present, shifts that mean by:
+The guidance hook lives inside the reverse DDPM step. In [`polydiff/models/diffusion.py`](polydiff/models/diffusion.py), `p_sample(...)` computes the usual reverse mean and then, if a guidance callback is present, shifts that mean by:
 
 ```text
 model_mean <- model_mean + posterior_variance_t * guidance_grad(x_t, t)
@@ -212,10 +274,12 @@ Shared idea:
 - input: timestep `t`
 - output: either class logits, a scalar score prediction, or a directly evaluated analytic geometry objective
 
-Current limitation:
+Current limitations:
 
-- the learned guidance models are currently MLPs only
-- the sampler interface is already generic enough that a future GNN guidance model can plug in later without changing the diffusion loop
+- the learned classifier/regressor guidance models are still fixed-size MLPs
+- checkpoint-backed classifier/regressor guidance only supports uniform-size sampled batches
+- analytic `regularity` and `area` guidance now work on mixed-size GAT/GCN batches
+- guidance-model training is still fixed-size only
 - the analytic regularity path is differentiable, but it still omits the discrete self-intersection test because that part of the original NumPy score is not autograd-friendly
 - the analytic area path can easily encourage scale blow-up, because increasing polygon area is often easiest by just making the sample larger
 

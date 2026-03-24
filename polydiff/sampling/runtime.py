@@ -17,6 +17,8 @@ from ..data.diagnostics import (
     json_ready,
     summarize_polygon_dataset,
 )
+from ..data.gen_polygons import normalize_size_distribution
+from ..data.polygon_dataset import load_polygon_dataset
 from ..models.diffusion import Diffusion, DiffusionConfig, build_denoiser
 from ..utils.runtime import resolve_project_path
 
@@ -54,6 +56,12 @@ class GuidanceOptions:
 
 
 @dataclass(frozen=True, slots=True)
+class SizeDistributionOptions:
+    values: tuple[int, ...]
+    probabilities: tuple[float, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class SamplingRequest:
     num_samples: int
     n_steps: int
@@ -61,6 +69,7 @@ class SamplingRequest:
     animation: AnimationOptions | None
     diagnostics: DiagnosticsOptions
     guidance: GuidanceOptions
+    size_distribution: SizeDistributionOptions | None
 
 
 def load_diffusion_from_checkpoint(
@@ -72,8 +81,8 @@ def load_diffusion_from_checkpoint(
 
     checkpoint_model_cfg = dict(checkpoint.get("model_cfg", {}))
     checkpoint_model_cfg.setdefault("type", "gat")
-    n_vertices = int(checkpoint.get("n_vertices", 6))
-    model = build_denoiser(data_dim=n_vertices * 2, model_cfg=checkpoint_model_cfg)
+    max_vertices = int(checkpoint.get("max_vertices", checkpoint.get("n_vertices", 6)))
+    model = build_denoiser(data_dim=max_vertices * 2, model_cfg=checkpoint_model_cfg)
     model.load_state_dict(checkpoint["model_state"])
 
     checkpoint_diffusion_cfg = checkpoint.get("diffusion", {})
@@ -83,7 +92,7 @@ def load_diffusion_from_checkpoint(
         beta_end=float(checkpoint_diffusion_cfg.get("beta_end", 2e-2)),
     )
     diffusion = Diffusion(model=model, config=diffusion_config, device=device)
-    return checkpoint, diffusion, diffusion_config, n_vertices
+    return checkpoint, diffusion, diffusion_config, max_vertices
 
 
 def normalize_animation_out_path(path_like: str | Path) -> Path:
@@ -238,6 +247,23 @@ def resolve_guidance_options(sampling_cfg: dict[str, Any]) -> GuidanceOptions:
     )
 
 
+def resolve_size_distribution_options(sampling_cfg: dict[str, Any]) -> SizeDistributionOptions | None:
+    size_cfg = sampling_cfg.get("size_distribution")
+    if size_cfg is None:
+        return None
+    if not isinstance(size_cfg, dict):
+        raise ValueError("sampling.size_distribution must be a mapping if provided")
+    values = size_cfg.get("values")
+    if values is None:
+        return None
+    probabilities = size_cfg.get("probabilities")
+    sizes, probs = normalize_size_distribution(values, probabilities)
+    return SizeDistributionOptions(
+        values=tuple(int(value) for value in sizes.tolist()),
+        probabilities=tuple(float(prob) for prob in probs.tolist()),
+    )
+
+
 def resolve_sampling_request(
     sampling_cfg: dict[str, Any],
     *,
@@ -298,6 +324,7 @@ def resolve_sampling_request(
         animation=animation,
         diagnostics=resolve_diagnostics_options(sampling_cfg),
         guidance=resolve_guidance_options(sampling_cfg),
+        size_distribution=resolve_size_distribution_options(sampling_cfg),
     )
 
 
@@ -313,10 +340,37 @@ def save_animation(trajectory: torch.Tensor, n_vertices: int, options: Animation
     )
 
 
-def save_animations(trajectories: torch.Tensor, n_vertices: int, options: AnimationOptions) -> list[Path]:
+def save_animations(
+    trajectories: torch.Tensor | list[torch.Tensor],
+    n_vertices: int | None,
+    options: AnimationOptions,
+) -> list[Path]:
     from ..data.plot_polygons import save_polygon_animation
 
     output_paths = animation_output_paths(options)
+    if isinstance(trajectories, list):
+        if len(trajectories) != len(output_paths):
+            raise ValueError(f"expected {len(output_paths)} trajectories, got {len(trajectories)}")
+        saved_paths: list[Path] = []
+        for trajectory, out_path in zip(trajectories, output_paths):
+            trajectory_cpu = trajectory.detach().cpu()
+            if trajectory_cpu.ndim != 3 or trajectory_cpu.shape[-1] != 2:
+                raise ValueError(
+                    f"graph trajectory must have shape (frames, n_vertices, 2), got {tuple(trajectory_cpu.shape)}"
+                )
+            saved_paths.append(
+                save_polygon_animation(
+                    trajectory_cpu.numpy().astype(np.float32),
+                    out_path,
+                    fps=options.fps,
+                    max_frames=options.max_frames,
+                )
+            )
+        return saved_paths
+
+    if n_vertices is None:
+        raise ValueError("n_vertices is required when saving dense trajectories")
+
     trajectories_cpu = trajectories.detach().cpu()
     if trajectories_cpu.ndim == 2:
         trajectories_cpu = trajectories_cpu.unsqueeze(1)
@@ -350,8 +404,8 @@ def resolve_reference_summary(
     options: DiagnosticsOptions,
 ) -> tuple[dict[str, float | int] | None, Path | None, str | None]:
     if options.reference_data_path is not None:
-        data = np.load(options.reference_data_path, allow_pickle=True)
-        summary = summarize_polygon_dataset(np.asarray(data["coords"], dtype=np.float32))
+        dataset = load_polygon_dataset(options.reference_data_path)
+        summary = summarize_polygon_dataset(dataset)
         return summary, options.reference_data_path, "reference_file"
 
     summary = checkpoint.get("training_data_summary")
@@ -363,8 +417,8 @@ def resolve_reference_summary(
     if training_data_path is not None:
         resolved_path = resolve_project_path(training_data_path)
         if resolved_path.exists():
-            data = np.load(resolved_path, allow_pickle=True)
-            summary = summarize_polygon_dataset(np.asarray(data["coords"], dtype=np.float32))
+            dataset = load_polygon_dataset(resolved_path)
+            summary = summarize_polygon_dataset(dataset)
             return summary, resolved_path, "training_data_file"
 
     return None, None, None
@@ -377,6 +431,7 @@ def write_sampling_diagnostics(
     config_path: Path,
     samples_out_path: Path,
     coords: np.ndarray,
+    num_vertices: np.ndarray | None,
     options: DiagnosticsOptions,
     sampling_n_steps: int,
     sample_run_name: str | None = None,
@@ -384,7 +439,7 @@ def write_sampling_diagnostics(
     if not options.enabled:
         return None
 
-    generated_summary = summarize_polygon_dataset(coords)
+    generated_summary = summarize_polygon_dataset(coords, num_vertices=num_vertices)
     reference_summary, reference_path, reference_source = resolve_reference_summary(checkpoint, options)
     delta_vs_reference = (
         None if reference_summary is None else compare_polygon_summaries(reference_summary, generated_summary)
