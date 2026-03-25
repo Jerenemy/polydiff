@@ -1,0 +1,35 @@
+# Ignore everything by default
+*
+
+# Keep repo metadata and top-level configs
+!.gitignore
+!README.md
+!pyproject.toml
+!poetry.lock
+
+# Keep source/notebooks/scripts
+!*.py
+!*.ipynb
+!check_dipoles.py
+
+# Keep binding-affinity assets
+!predict_binding_affinity/
+!predict_binding_affinity/**/*
+predict_binding_affinity/checkpoints/
+predict_binding_affinity/metrics_dir/
+
+# Common junk / large outputs
+data/
+runs/
+checkpoints/
+metrics_dir/
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
+*.pt
+*.pth
+*.ckpt
+*.log
+*.nbconvert.ipynb
+
