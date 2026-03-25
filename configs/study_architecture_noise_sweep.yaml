@@ -1,0 +1,324 @@
+# Compare MLP, GAT, and GCN as the training polygon dataset becomes noisier.
+# Generate the referenced datasets first:
+# python scripts/generate_data/generate_thesis_datasets.py
+# Then run:
+# python -m polydiff.studies.run --config configs/study_architecture_noise_sweep.yaml
+
+study:
+  name: "architecture-noise-sweep"
+  root_dir: "data/studies"
+  parallel:
+    enabled: false
+    max_workers: 2
+    require_cuda: true
+  summary:
+    representative_count: 12
+    outlier_count: 12
+    max_projection_points: 2000
+
+cases:
+  - name: "train-mlp-baseline"
+    kind: "train_diffusion"
+    config: "configs/train_diffusion.yaml"
+    tags:
+      stage: "train"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+    overrides:
+      data.path: "data/raw/hexagons.npz"
+      model.type: "mlp"
+      model.use_global_features: null
+
+  - name: "train-gat-baseline"
+    kind: "train_diffusion"
+    config: "configs/train_diffusion.yaml"
+    tags:
+      stage: "train"
+      architecture: "gat"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+    overrides:
+      data.path: "data/raw/hexagons.npz"
+      model.type: "gat"
+      model.use_global_features: false
+
+  - name: "train-gcn-baseline"
+    kind: "train_diffusion"
+    config: "configs/train_diffusion.yaml"
+    tags:
+      stage: "train"
+      architecture: "gcn"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+    overrides:
+      data.path: "data/raw/hexagons.npz"
+      model.type: "gcn"
+      model.use_global_features: false
+
+  - name: "train-mlp-noisy"
+    kind: "train_diffusion"
+    config: "configs/train_diffusion.yaml"
+    tags:
+      stage: "train"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "noisy"
+      dataset_noise_rank: 2
+    overrides:
+      data.path: "data/raw/hexagons_noisy.npz"
+      model.type: "mlp"
+      model.use_global_features: null
+
+  - name: "train-gat-noisy"
+    kind: "train_diffusion"
+    config: "configs/train_diffusion.yaml"
+    tags:
+      stage: "train"
+      architecture: "gat"
+      dataset_family: "hexagons"
+      dataset_noise: "noisy"
+      dataset_noise_rank: 2
+    overrides:
+      data.path: "data/raw/hexagons_noisy.npz"
+      model.type: "gat"
+      model.use_global_features: false
+
+  - name: "train-gcn-noisy"
+    kind: "train_diffusion"
+    config: "configs/train_diffusion.yaml"
+    tags:
+      stage: "train"
+      architecture: "gcn"
+      dataset_family: "hexagons"
+      dataset_noise: "noisy"
+      dataset_noise_rank: 2
+    overrides:
+      data.path: "data/raw/hexagons_noisy.npz"
+      model.type: "gcn"
+      model.use_global_features: false
+
+  - name: "train-mlp-very-noisy"
+    kind: "train_diffusion"
+    config: "configs/train_diffusion.yaml"
+    tags:
+      stage: "train"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "very_noisy"
+      dataset_noise_rank: 3
+    overrides:
+      data.path: "data/raw/hexagons_very_noisy.npz"
+      model.type: "mlp"
+      model.use_global_features: null
+
+  - name: "train-gat-very-noisy"
+    kind: "train_diffusion"
+    config: "configs/train_diffusion.yaml"
+    tags:
+      stage: "train"
+      architecture: "gat"
+      dataset_family: "hexagons"
+      dataset_noise: "very_noisy"
+      dataset_noise_rank: 3
+    overrides:
+      data.path: "data/raw/hexagons_very_noisy.npz"
+      model.type: "gat"
+      model.use_global_features: false
+
+  - name: "train-gcn-very-noisy"
+    kind: "train_diffusion"
+    config: "configs/train_diffusion.yaml"
+    tags:
+      stage: "train"
+      architecture: "gcn"
+      dataset_family: "hexagons"
+      dataset_noise: "very_noisy"
+      dataset_noise_rank: 3
+    overrides:
+      data.path: "data/raw/hexagons_very_noisy.npz"
+      model.type: "gcn"
+      model.use_global_features: false
+
+  - name: "sample-mlp-baseline"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "architecture_noise"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: false
+      guidance_schedule: "unguided"
+      guidance_scale: 0.0
+    overrides:
+      model.run: "{{train-mlp-baseline.run_name}}"
+      sampling.guidance:
+        enabled: false
+      sampling.restoration:
+        enabled: false
+      sampling.num_samples: 10000
+
+  - name: "sample-gat-baseline"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "architecture_noise"
+      architecture: "gat"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: false
+      guidance_schedule: "unguided"
+      guidance_scale: 0.0
+    overrides:
+      model.run: "{{train-gat-baseline.run_name}}"
+      sampling.guidance:
+        enabled: false
+      sampling.restoration:
+        enabled: false
+      sampling.num_samples: 10000
+
+  - name: "sample-gcn-baseline"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "architecture_noise"
+      architecture: "gcn"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: false
+      guidance_schedule: "unguided"
+      guidance_scale: 0.0
+    overrides:
+      model.run: "{{train-gcn-baseline.run_name}}"
+      sampling.guidance:
+        enabled: false
+      sampling.restoration:
+        enabled: false
+      sampling.num_samples: 10000
+
+  - name: "sample-mlp-noisy"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "architecture_noise"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "noisy"
+      dataset_noise_rank: 2
+      guidance_enabled: false
+      guidance_schedule: "unguided"
+      guidance_scale: 0.0
+    overrides:
+      model.run: "{{train-mlp-noisy.run_name}}"
+      sampling.guidance:
+        enabled: false
+      sampling.restoration:
+        enabled: false
+      sampling.num_samples: 10000
+
+  - name: "sample-gat-noisy"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "architecture_noise"
+      architecture: "gat"
+      dataset_family: "hexagons"
+      dataset_noise: "noisy"
+      dataset_noise_rank: 2
+      guidance_enabled: false
+      guidance_schedule: "unguided"
+      guidance_scale: 0.0
+    overrides:
+      model.run: "{{train-gat-noisy.run_name}}"
+      sampling.guidance:
+        enabled: false
+      sampling.restoration:
+        enabled: false
+      sampling.num_samples: 10000
+
+  - name: "sample-gcn-noisy"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "architecture_noise"
+      architecture: "gcn"
+      dataset_family: "hexagons"
+      dataset_noise: "noisy"
+      dataset_noise_rank: 2
+      guidance_enabled: false
+      guidance_schedule: "unguided"
+      guidance_scale: 0.0
+    overrides:
+      model.run: "{{train-gcn-noisy.run_name}}"
+      sampling.guidance:
+        enabled: false
+      sampling.restoration:
+        enabled: false
+      sampling.num_samples: 10000
+
+  - name: "sample-mlp-very-noisy"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "architecture_noise"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "very_noisy"
+      dataset_noise_rank: 3
+      guidance_enabled: false
+      guidance_schedule: "unguided"
+      guidance_scale: 0.0
+    overrides:
+      model.run: "{{train-mlp-very-noisy.run_name}}"
+      sampling.guidance:
+        enabled: false
+      sampling.restoration:
+        enabled: false
+      sampling.num_samples: 10000
+
+  - name: "sample-gat-very-noisy"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "architecture_noise"
+      architecture: "gat"
+      dataset_family: "hexagons"
+      dataset_noise: "very_noisy"
+      dataset_noise_rank: 3
+      guidance_enabled: false
+      guidance_schedule: "unguided"
+      guidance_scale: 0.0
+    overrides:
+      model.run: "{{train-gat-very-noisy.run_name}}"
+      sampling.guidance:
+        enabled: false
+      sampling.restoration:
+        enabled: false
+      sampling.num_samples: 10000
+
+  - name: "sample-gcn-very-noisy"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "architecture_noise"
+      architecture: "gcn"
+      dataset_family: "hexagons"
+      dataset_noise: "very_noisy"
+      dataset_noise_rank: 3
+      guidance_enabled: false
+      guidance_schedule: "unguided"
+      guidance_scale: 0.0
+    overrides:
+      model.run: "{{train-gcn-very-noisy.run_name}}"
+      sampling.guidance:
+        enabled: false
+      sampling.restoration:
+        enabled: false
+      sampling.num_samples: 10000

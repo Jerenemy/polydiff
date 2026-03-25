@@ -7,8 +7,13 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 
-from ..data.diagnostics import canonical_polygon_feature_matrix, polygon_metric_table
+from ..data.diagnostics import (
+    DEFAULT_OUTLIER_FAILURE_MODE_ORDER,
+    canonical_polygon_feature_matrix,
+    polygon_metric_table,
+)
 from ..data.plot_polygons import plot_polygon
 from ..data.polygon_dataset import PolygonDatasetArrays
 
@@ -147,6 +152,208 @@ def save_polygon_gallery(
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+    return out_path
+
+
+def save_multi_case_score_distribution_figure(
+    case_tables: list[tuple[str, pd.DataFrame]],
+    out_path: str | Path,
+    *,
+    title: str = "Score Distribution Comparison",
+) -> Path | None:
+    if len(case_tables) < 2:
+        return None
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(7.4, 4.8))
+    bins = np.linspace(0.0, 1.0, num=41, dtype=np.float64)
+    colors = plt.get_cmap("tab10")
+    for index, (label, table) in enumerate(case_tables):
+        if "score" not in table.columns:
+            continue
+        ax.hist(
+            table["score"].to_numpy(dtype=np.float64, copy=False),
+            bins=bins,
+            density=True,
+            histtype="step",
+            linewidth=1.6,
+            label=label,
+            color=colors(index % 10),
+        )
+    ax.set_xlabel("regularity score")
+    ax.set_ylabel("density")
+    ax.set_title(title)
+    ax.legend(frameon=False, fontsize=9)
+    ax.grid(alpha=0.2)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+    return out_path
+
+
+def _metric_label(metric_key: str) -> str:
+    labels = {
+        "generated_summary.score_mean": "score mean",
+        "generated_summary.score_p95": "score p95",
+        "generated_summary.score_p99": "score p99",
+        "score_threshold_rates.score_ge_0p6_rate": "rate score >= 0.6",
+        "score_threshold_rates.score_ge_0p7_rate": "rate score >= 0.7",
+        "score_threshold_rates.score_ge_0p8_rate": "rate score >= 0.8",
+        "distribution_distances.shape_distribution_shift_mean_normalized_w1": "shape shift",
+        "distribution_distances.pose_distribution_shift_mean_normalized_w1": "pose drift",
+        "generated_summary.self_intersection_rate": "self-intersection rate",
+    }
+    return labels.get(metric_key, metric_key.split(".")[-1].replace("_", " "))
+
+
+def save_metric_sweep_figure(
+    summary_df: pd.DataFrame,
+    out_path: str | Path,
+    *,
+    x_key: str,
+    x_label: str,
+    title: str,
+    x_scale: str = "linear",
+    metric_keys: tuple[str, ...] = (
+        "generated_summary.score_mean",
+        "generated_summary.score_p99",
+        "score_threshold_rates.score_ge_0p7_rate",
+        "distribution_distances.shape_distribution_shift_mean_normalized_w1",
+    ),
+    group_key: str | None = None,
+    group_order: list[str] | None = None,
+    x_order: list[str] | None = None,
+) -> Path | None:
+    available_metrics = [metric for metric in metric_keys if metric in summary_df.columns]
+    if summary_df.empty or x_key not in summary_df.columns or not available_metrics:
+        return None
+
+    plot_df = summary_df.copy()
+    if x_order is not None:
+        order_lookup = {value: index for index, value in enumerate(x_order)}
+        plot_df["_x_sort_key"] = plot_df[x_key].map(lambda value: order_lookup.get(value, len(order_lookup)))
+    else:
+        plot_df["_x_sort_key"] = plot_df[x_key]
+
+    if group_key is None or group_key not in plot_df.columns:
+        group_values = [("__single__", plot_df)]
+    else:
+        if group_order is None:
+            ordered_values = sorted(str(value) for value in plot_df[group_key].dropna().unique().tolist())
+        else:
+            ordered_values = list(group_order)
+        group_values = [
+            (group_value, plot_df[plot_df[group_key].astype(str) == str(group_value)].copy())
+            for group_value in ordered_values
+        ]
+        group_values = [(name, frame) for name, frame in group_values if not frame.empty]
+        if not group_values:
+            return None
+
+    n_metrics = min(4, len(available_metrics))
+    fig, axes = plt.subplots(2, 2, figsize=(10.8, 7.2))
+    axes_array = np.atleast_1d(axes).reshape(-1)
+    colors = plt.get_cmap("tab10")
+    categorical_x = x_order is not None or plot_df[x_key].dtype == object
+    x_tick_positions = None
+    x_tick_labels = None
+    if categorical_x:
+        categories = x_order or [str(value) for value in plot_df.sort_values("_x_sort_key")[x_key].drop_duplicates().tolist()]
+        x_tick_positions = np.arange(len(categories), dtype=np.float64)
+        x_tick_labels = categories
+
+    for axis_index, metric_key in enumerate(available_metrics[:n_metrics]):
+        ax = axes_array[axis_index]
+        for group_index, (group_name, group_frame) in enumerate(group_values):
+            ordered = group_frame.sort_values(["_x_sort_key", x_key], kind="stable")
+            if categorical_x:
+                position_lookup = {label: position for position, label in enumerate(x_tick_labels or [])}
+                x_values = np.asarray(
+                    [position_lookup[str(value)] for value in ordered[x_key].tolist()],
+                    dtype=np.float64,
+                )
+            else:
+                x_values = ordered[x_key].to_numpy(dtype=np.float64, copy=False)
+            y_values = ordered[metric_key].to_numpy(dtype=np.float64, copy=False)
+            label = None if group_name == "__single__" else str(group_name)
+            ax.plot(
+                x_values,
+                y_values,
+                marker="o",
+                linewidth=1.6,
+                markersize=4.5,
+                color=colors(group_index % 10),
+                label=label,
+            )
+        ax.set_ylabel(_metric_label(metric_key))
+        ax.grid(alpha=0.2)
+        if categorical_x and x_tick_positions is not None and x_tick_labels is not None:
+            ax.set_xticks(x_tick_positions, x_tick_labels, rotation=20, ha="right")
+        elif x_scale == "symlog":
+            ax.set_xscale("symlog", linthresh=1.0)
+        elif x_scale == "log":
+            ax.set_xscale("log")
+        ax.set_xlabel(x_label)
+
+    for ax in axes_array[n_metrics:]:
+        ax.axis("off")
+
+    if len(group_values) > 1:
+        axes_array[0].legend(frameon=False, fontsize=9)
+    fig.suptitle(title, fontsize=14)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+    return out_path
+
+
+def save_failure_mode_rate_figure(
+    summary_df: pd.DataFrame,
+    out_path: str | Path,
+    *,
+    title: str = "Outlier Failure Modes",
+    prefix: str = "outlier_failure_modes",
+) -> Path | None:
+    if summary_df.empty or "case_name" not in summary_df.columns:
+        return None
+    count_columns = [f"{prefix}.{mode}_count" for mode in DEFAULT_OUTLIER_FAILURE_MODE_ORDER if f"{prefix}.{mode}_count" in summary_df.columns]
+    if not count_columns:
+        return None
+
+    plot_df = summary_df.loc[:, ["case_name", *count_columns]].copy()
+    if plot_df[count_columns].to_numpy(dtype=np.float64).sum() <= 0.0:
+        return None
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(8.2, max(3.8, 0.65 * len(plot_df))))
+    colors = plt.get_cmap("tab20")
+    left = np.zeros((len(plot_df),), dtype=np.float64)
+    y_positions = np.arange(len(plot_df), dtype=np.float64)
+    for index, column in enumerate(count_columns):
+        label = column.split(".")[-1].replace("_count", "").replace("_", " ")
+        values = plot_df[column].to_numpy(dtype=np.float64, copy=False)
+        ax.barh(
+            y_positions,
+            values,
+            left=left,
+            color=colors(index % 20),
+            label=label,
+            alpha=0.9,
+        )
+        left = left + values
+    ax.set_yticks(y_positions, plot_df["case_name"].tolist())
+    ax.set_xlabel("count among labeled outliers")
+    ax.set_title(title)
+    ax.invert_yaxis()
+    ax.grid(axis="x", alpha=0.2)
+    ax.legend(frameon=False, fontsize=8)
+    fig.tight_layout()
     fig.savefig(out_path, dpi=160)
     plt.close(fig)
     return out_path

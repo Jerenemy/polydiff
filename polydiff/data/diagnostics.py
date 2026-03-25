@@ -36,7 +36,14 @@ DEFAULT_DISTRIBUTION_METRICS = (
     *DEFAULT_SHAPE_DISTRIBUTION_METRICS,
     *DEFAULT_POSE_DISTRIBUTION_METRICS,
 )
-DEFAULT_SCORE_THRESHOLDS = (0.90, 0.95)
+DEFAULT_SCORE_THRESHOLDS = (0.60, 0.70, 0.80, 0.90, 0.95)
+DEFAULT_OUTLIER_FAILURE_MODE_ORDER = (
+    "self_intersection",
+    "edge_collapse_or_spike",
+    "off_manifold_regular",
+    "low_score_irregular",
+    "other_shape_outlier",
+)
 PER_POLYGON_METRIC_COLUMNS = (
     "polygon_index",
     "num_vertices",
@@ -353,6 +360,7 @@ def summarize_polygon_dataset(
         "score_p05": float(np.quantile(score, 0.05)),
         "score_p50": float(np.quantile(score, 0.50)),
         "score_p95": float(np.quantile(score, 0.95)),
+        "score_p99": float(np.quantile(score, 0.99)),
         "edge_cv_mean": float(metrics["edge_cv"].mean()),
         "angle_cv_mean": float(metrics["angle_cv"].mean()),
         "radius_cv_mean": float(metrics["radius_cv"].mean()),
@@ -366,6 +374,68 @@ def summarize_polygon_dataset(
     if dataset.is_uniform and dataset.num_polygons > 0:
         out["n_vertices"] = int(dataset.num_vertices[0])
     return out
+
+
+def outlier_failure_mode_summary(
+    reference_table: pd.DataFrame,
+    observed_table: pd.DataFrame,
+    *,
+    outlier_indices: np.ndarray | list[int],
+) -> dict[str, float | int]:
+    """Label a small set of anomalous polygons with coarse failure modes."""
+    outlier_index_array = np.asarray(outlier_indices, dtype=np.int32).reshape(-1)
+    counts = {mode: 0 for mode in DEFAULT_OUTLIER_FAILURE_MODE_ORDER}
+    if outlier_index_array.size == 0:
+        return {
+            "outlier_count": 0,
+            **{f"{mode}_count": 0 for mode in DEFAULT_OUTLIER_FAILURE_MODE_ORDER},
+            **{f"{mode}_rate": 0.0 for mode in DEFAULT_OUTLIER_FAILURE_MODE_ORDER},
+        }
+
+    quantile_thresholds = {
+        "score_q05": float(reference_table["score"].quantile(0.05)),
+        "score_q95": float(reference_table["score"].quantile(0.95)),
+        "edge_cv_q95": float(reference_table["edge_cv"].quantile(0.95)),
+        "angle_cv_q95": float(reference_table["angle_cv"].quantile(0.95)),
+        "radius_cv_q95": float(reference_table["radius_cv"].quantile(0.95)),
+        "min_radius_q05": float(reference_table["min_radius"].quantile(0.05)),
+        "compactness_q05": float(reference_table["compactness"].quantile(0.05)),
+    }
+    anomaly_metrics = ("score", "edge_cv", "angle_cv", "radius_cv", "area", "compactness")
+    ref_mean = reference_table.loc[:, anomaly_metrics].mean(axis=0)
+    ref_std = reference_table.loc[:, anomaly_metrics].std(axis=0).clip(lower=1e-6)
+
+    for polygon_index in outlier_index_array.tolist():
+        row = observed_table.loc[int(polygon_index)]
+        anomaly = float(
+            np.mean(np.abs((row.loc[list(anomaly_metrics)] - ref_mean) / ref_std))
+        )
+        if float(row["self_intersection"]) > 0.5:
+            label = "self_intersection"
+        elif (
+            float(row["min_radius"]) <= quantile_thresholds["min_radius_q05"]
+            and (
+                float(row["edge_cv"]) >= quantile_thresholds["edge_cv_q95"]
+                or float(row["radius_cv"]) >= quantile_thresholds["radius_cv_q95"]
+                or float(row["angle_cv"]) >= quantile_thresholds["angle_cv_q95"]
+                or float(row["compactness"]) <= quantile_thresholds["compactness_q05"]
+            )
+        ):
+            label = "edge_collapse_or_spike"
+        elif float(row["score"]) >= quantile_thresholds["score_q95"] and anomaly >= 2.0:
+            label = "off_manifold_regular"
+        elif float(row["score"]) <= quantile_thresholds["score_q05"]:
+            label = "low_score_irregular"
+        else:
+            label = "other_shape_outlier"
+        counts[label] += 1
+
+    total = int(outlier_index_array.size)
+    return {
+        "outlier_count": total,
+        **{f"{mode}_count": int(counts[mode]) for mode in DEFAULT_OUTLIER_FAILURE_MODE_ORDER},
+        **{f"{mode}_rate": float(counts[mode] / total) for mode in DEFAULT_OUTLIER_FAILURE_MODE_ORDER},
+    }
 
 
 def compare_polygon_summaries(

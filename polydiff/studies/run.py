@@ -22,6 +22,7 @@ from ..data.diagnostics import (
     compare_polygon_summaries,
     json_ready,
     metric_threshold_rates,
+    outlier_failure_mode_summary,
     outlier_polygon_indices,
     polygon_metric_table,
     representative_polygon_indices,
@@ -40,7 +41,14 @@ from ..sampling.runtime import (
 from ..training.train import train_from_loaded_config
 from ..training.train_guidance_model import train_guidance_model_from_loaded_config
 from ..utils.runtime import load_yaml_config, resolve_project_path
-from .plots import save_pca_projection_figure, save_polygon_gallery, save_score_distribution_figure
+from .plots import (
+    save_failure_mode_rate_figure,
+    save_metric_sweep_figure,
+    save_multi_case_score_distribution_figure,
+    save_pca_projection_figure,
+    save_polygon_gallery,
+    save_score_distribution_figure,
+)
 from .runtime import (
     StudyCase,
     StudyParallelOptions,
@@ -239,7 +247,7 @@ def _case_log_path(*, paths_obj: StudyPaths, case_index: int, case_name: str) ->
 
 def _run_case_entrypoint(*, kind: str, name: str, config_path: Path, result_path: Path) -> Path:
     resolved_config = load_yaml_config(config_path)
-    case = StudyCase(name=name, kind=kind, config_path=config_path, overrides={})
+    case = StudyCase(name=name, kind=kind, config_path=config_path, overrides={}, tags={})
     result = _run_case(case, resolved_config=resolved_config, resolved_config_path=config_path)
     return _write_json(result_path, result)
 
@@ -444,6 +452,7 @@ def _write_case_results(path: Path, case_results: dict[str, dict[str, Any]]) -> 
 def _write_case_report(
     *,
     paths_obj: StudyPaths,
+    case: StudyCase,
     case_name: str,
     case_result: dict[str, Any],
     figure_paths: dict[str, str] | None = None,
@@ -452,6 +461,7 @@ def _write_case_report(
     payload = {
         "case_name": case_name,
         "case_kind": case_result.get("case_kind"),
+        "case_tags": case.tags,
         "case_result": case_result,
         "figure_paths": figure_paths or {},
         "summary_row": summary_row,
@@ -468,6 +478,46 @@ def _select_reference_path(spec: StudySpec, diagnostics_payload: dict[str, Any] 
     return None if reference_path is None else resolve_project_path(reference_path)
 
 
+def _load_case_comparison_artifacts(
+    *,
+    spec: StudySpec,
+    case_result: dict[str, Any],
+    diagnostics_payload: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    sample_path = Path(case_result["samples_out_path"])
+    if not sample_path.exists():
+        return None
+
+    generated_dataset = load_polygon_dataset(sample_path)
+    generated_metrics_path = case_result.get("metrics_path")
+    if generated_metrics_path is None or not Path(generated_metrics_path).exists():
+        generated_table = polygon_metric_table(generated_dataset)
+    else:
+        generated_table = pd.read_csv(generated_metrics_path)
+
+    reference_path = _select_reference_path(spec, diagnostics_payload)
+    if reference_path is None or not reference_path.exists():
+        return {
+            "sample_path": sample_path,
+            "generated_dataset": generated_dataset,
+            "generated_table": generated_table,
+            "reference_path": None,
+            "reference_dataset": None,
+            "reference_table": None,
+        }
+
+    reference_dataset = load_polygon_dataset(reference_path)
+    reference_table = polygon_metric_table(reference_dataset)
+    return {
+        "sample_path": sample_path,
+        "generated_dataset": generated_dataset,
+        "generated_table": generated_table,
+        "reference_path": reference_path,
+        "reference_dataset": reference_dataset,
+        "reference_table": reference_table,
+    }
+
+
 def _generate_case_figures(
     *,
     spec: StudySpec,
@@ -475,31 +525,20 @@ def _generate_case_figures(
     case_name: str,
     case_result: dict[str, Any],
     diagnostics_payload: dict[str, Any] | None,
+    comparison_artifacts: dict[str, Any] | None,
 ) -> dict[str, str]:
-    sample_path = Path(case_result["samples_out_path"])
-    if not sample_path.exists():
+    if comparison_artifacts is None:
         return {}
 
-    generated_dataset = load_polygon_dataset(sample_path)
-    reference_path = _select_reference_path(spec, diagnostics_payload)
-    if reference_path is None or not reference_path.exists():
+    generated_dataset = comparison_artifacts["generated_dataset"]
+    generated_table = comparison_artifacts["generated_table"]
+    reference_dataset = comparison_artifacts["reference_dataset"]
+    reference_table = comparison_artifacts["reference_table"]
+    if reference_dataset is None or reference_table is None:
         return {}
-    reference_dataset = load_polygon_dataset(reference_path)
 
     case_figure_dir = paths_obj.figures_dir / slugify(case_name)
     case_figure_dir.mkdir(parents=True, exist_ok=True)
-
-    generated_metrics_path = case_result.get("metrics_path")
-    if generated_metrics_path is None or not Path(generated_metrics_path).exists():
-        generated_table = None
-    else:
-        generated_table = pd.read_csv(generated_metrics_path)
-
-    from ..data.diagnostics import polygon_metric_table
-
-    reference_table = polygon_metric_table(reference_dataset)
-    if generated_table is None:
-        generated_table = polygon_metric_table(generated_dataset)
 
     figure_paths: dict[str, str] = {}
     score_dist_path = save_score_distribution_figure(
@@ -557,6 +596,7 @@ def _build_sample_case_summary_entry(
     *,
     spec: StudySpec,
     paths_obj: StudyPaths,
+    case: StudyCase,
     case_name: str,
     case_result: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, str]]:
@@ -569,14 +609,45 @@ def _build_sample_case_summary_entry(
         "metrics_path": case_result.get("metrics_path"),
         "diagnostics_path": case_result.get("diagnostics_path"),
     }
+    row.update(flatten_mapping(case.tags, prefix="case_tags"))
     if diagnostics_payload is not None:
         row.update(flatten_mapping(diagnostics_payload))
+    comparison_artifacts = _load_case_comparison_artifacts(
+        spec=spec,
+        case_result=case_result,
+        diagnostics_payload=diagnostics_payload,
+    )
+    if comparison_artifacts is not None:
+        generated_table = comparison_artifacts["generated_table"]
+        row.setdefault("generated_summary.score_p99", float(generated_table["score"].quantile(0.99)))
+        for key, value in metric_threshold_rates(
+            generated_table["score"].to_numpy(dtype=float, copy=False),
+            metric_name="score",
+            thresholds=DEFAULT_SCORE_THRESHOLDS,
+        ).items():
+            row.setdefault(f"score_threshold_rates.{key}", value)
+        reference_table = comparison_artifacts["reference_table"]
+        if reference_table is not None:
+            outlier_indices = None if diagnostics_payload is None else diagnostics_payload.get("outlier_polygon_indices")
+            if outlier_indices is None:
+                outlier_indices = outlier_polygon_indices(
+                    comparison_artifacts["reference_dataset"],
+                    comparison_artifacts["generated_dataset"],
+                    count=spec.summary.outlier_count,
+                ).tolist()
+            failure_summary = outlier_failure_mode_summary(
+                reference_table,
+                generated_table,
+                outlier_indices=outlier_indices[: spec.summary.outlier_count],
+            )
+            row.update(flatten_mapping({"outlier_failure_modes": failure_summary}))
     figure_paths = _generate_case_figures(
         spec=spec,
         paths_obj=paths_obj,
         case_name=case_name,
         case_result=case_result,
         diagnostics_payload=diagnostics_payload,
+        comparison_artifacts=comparison_artifacts,
     )
     return row, figure_paths
 
@@ -615,8 +686,254 @@ def _write_tradeoff_plot(summary_df: pd.DataFrame, *, out_path: Path) -> Path | 
     return out_path
 
 
+def _frame_for_analysis_group(
+    summary_df: pd.DataFrame,
+    *,
+    analysis_group: str,
+    include_guidance_baseline: bool = False,
+) -> pd.DataFrame:
+    if "case_tags.analysis_group" not in summary_df.columns:
+        return summary_df.iloc[0:0].copy()
+    mask = summary_df["case_tags.analysis_group"].astype(str) == analysis_group
+    if include_guidance_baseline and "case_tags.guidance_baseline" in summary_df.columns:
+        baseline_mask = summary_df["case_tags.guidance_baseline"].fillna(False).astype(bool)
+        mask = mask | baseline_mask
+    return summary_df.loc[mask].copy()
+
+
+def _load_case_score_tables(frame: pd.DataFrame, *, label_key: str) -> list[tuple[str, pd.DataFrame]]:
+    case_tables: list[tuple[str, pd.DataFrame]] = []
+    if "metrics_path" not in frame.columns or label_key not in frame.columns:
+        return case_tables
+    for _, row in frame.iterrows():
+        metrics_path = row.get("metrics_path")
+        if metrics_path is None:
+            continue
+        resolved = Path(metrics_path)
+        if not resolved.exists():
+            continue
+        case_tables.append((str(row[label_key]), pd.read_csv(resolved)))
+    return case_tables
+
+
+def _ordered_noise_labels(frame: pd.DataFrame) -> list[str]:
+    if "case_tags.dataset_noise" not in frame.columns:
+        return []
+    if "case_tags.dataset_noise_rank" not in frame.columns:
+        return [str(value) for value in frame["case_tags.dataset_noise"].dropna().drop_duplicates().tolist()]
+    order_frame = (
+        frame.loc[:, ["case_tags.dataset_noise", "case_tags.dataset_noise_rank"]]
+        .drop_duplicates()
+        .sort_values(["case_tags.dataset_noise_rank", "case_tags.dataset_noise"], kind="stable")
+    )
+    return [str(value) for value in order_frame["case_tags.dataset_noise"].tolist()]
+
+
+def _group_key_for_frame(frame: pd.DataFrame) -> tuple[str | None, list[str] | None]:
+    if "case_tags.dataset_noise" in frame.columns and frame["case_tags.dataset_noise"].nunique(dropna=True) > 1:
+        return "case_tags.dataset_noise", _ordered_noise_labels(frame)
+    if "case_tags.architecture" in frame.columns and frame["case_tags.architecture"].nunique(dropna=True) > 1:
+        order = [arch for arch in ("mlp", "gat", "gcn") if arch in frame["case_tags.architecture"].astype(str).unique()]
+        return "case_tags.architecture", order or None
+    return None, None
+
+
+def _write_analysis_figures(summary_df: pd.DataFrame, *, paths_obj: StudyPaths) -> dict[str, str]:
+    if summary_df.empty:
+        return {}
+
+    figure_paths: dict[str, str] = {}
+    architecture_order = [arch for arch in ("mlp", "gat", "gcn") if arch in summary_df.get("case_tags.architecture", pd.Series(dtype=str)).astype(str).unique()]
+
+    architecture_frame = summary_df.copy()
+    if "case_tags.analysis_group" in architecture_frame.columns:
+        architecture_frame = architecture_frame[
+            architecture_frame["case_tags.analysis_group"].astype(str).isin({"architecture_baseline", "architecture_noise"})
+        ]
+    if "case_tags.guidance_schedule" in architecture_frame.columns:
+        architecture_frame = architecture_frame[architecture_frame["case_tags.guidance_schedule"].astype(str) == "unguided"]
+    elif "case_tags.guidance_enabled" in architecture_frame.columns:
+        architecture_frame = architecture_frame[~architecture_frame["case_tags.guidance_enabled"].fillna(False).astype(bool)]
+    if not architecture_frame.empty and "case_tags.architecture" in architecture_frame.columns:
+        if "case_tags.dataset_noise" in architecture_frame.columns:
+            group_values = [
+                (noise_label, architecture_frame[architecture_frame["case_tags.dataset_noise"].astype(str) == noise_label].copy())
+                for noise_label in _ordered_noise_labels(architecture_frame)
+            ]
+        else:
+            group_values = [("architecture", architecture_frame)]
+        for noise_label, group_frame in group_values:
+            if group_frame.empty or group_frame["case_tags.architecture"].nunique(dropna=True) < 2:
+                continue
+            slug = slugify(str(noise_label))
+            title_suffix = "" if str(noise_label) == "architecture" else f" ({noise_label})"
+            overlay_path = save_multi_case_score_distribution_figure(
+                _load_case_score_tables(group_frame, label_key="case_tags.architecture"),
+                paths_obj.figures_dir / f"architecture_score_overlay__{slug}.png",
+                title=f"Architecture Score Distribution{title_suffix}",
+            )
+            if overlay_path is not None:
+                figure_paths[f"architecture_score_overlay__{slug}"] = str(overlay_path)
+            metric_panel_path = save_metric_sweep_figure(
+                group_frame,
+                paths_obj.figures_dir / f"architecture_metric_panel__{slug}.png",
+                x_key="case_tags.architecture",
+                x_label="architecture",
+                x_order=architecture_order or None,
+                title=f"Architecture Comparison{title_suffix}",
+            )
+            if metric_panel_path is not None:
+                figure_paths[f"architecture_metric_panel__{slug}"] = str(metric_panel_path)
+
+    schedule_frame = _frame_for_analysis_group(
+        summary_df,
+        analysis_group="guidance_schedule",
+        include_guidance_baseline=True,
+    )
+    if not schedule_frame.empty and "case_tags.guidance_schedule" in schedule_frame.columns:
+        group_key, group_order = _group_key_for_frame(schedule_frame)
+        schedule_path = save_metric_sweep_figure(
+            schedule_frame,
+            paths_obj.figures_dir / "guidance_schedule_sweep.png",
+            x_key="case_tags.guidance_schedule",
+            x_label="guidance schedule",
+            x_order=["unguided", "all", "early", "mid", "late", "linear_ramp", "quadratic_ramp"],
+            group_key=group_key,
+            group_order=group_order,
+            title="Guidance Timing Sweep",
+        )
+        if schedule_path is not None:
+            figure_paths["guidance_schedule_sweep"] = str(schedule_path)
+
+    strength_frame = _frame_for_analysis_group(
+        summary_df,
+        analysis_group="guidance_strength",
+        include_guidance_baseline=True,
+    )
+    if not strength_frame.empty and "case_tags.guidance_scale" in strength_frame.columns:
+        group_key, group_order = _group_key_for_frame(strength_frame)
+        strength_path = save_metric_sweep_figure(
+            strength_frame,
+            paths_obj.figures_dir / "guidance_strength_sweep.png",
+            x_key="case_tags.guidance_scale",
+            x_label="guidance scale",
+            x_scale="symlog",
+            group_key=group_key,
+            group_order=group_order,
+            title="Guidance Strength Sweep",
+        )
+        if strength_path is not None:
+            figure_paths["guidance_strength_sweep"] = str(strength_path)
+
+    noise_frame = _frame_for_analysis_group(summary_df, analysis_group="architecture_noise")
+    if (
+        not noise_frame.empty
+        and "case_tags.architecture" in noise_frame.columns
+        and "case_tags.dataset_noise" in noise_frame.columns
+        and noise_frame["case_tags.architecture"].nunique(dropna=True) > 1
+        and noise_frame["case_tags.dataset_noise"].nunique(dropna=True) > 1
+    ):
+        noise_path = save_metric_sweep_figure(
+            noise_frame,
+            paths_obj.figures_dir / "architecture_noise_sweep.png",
+            x_key="case_tags.dataset_noise",
+            x_label="training dataset noise",
+            x_order=_ordered_noise_labels(noise_frame),
+            group_key="case_tags.architecture",
+            group_order=architecture_order or None,
+            title="Architecture vs Training Dataset Noise",
+        )
+        if noise_path is not None:
+            figure_paths["architecture_noise_sweep"] = str(noise_path)
+
+    failure_modes_path = save_failure_mode_rate_figure(
+        summary_df,
+        paths_obj.figures_dir / "outlier_failure_modes.png",
+    )
+    if failure_modes_path is not None:
+        figure_paths["outlier_failure_modes"] = str(failure_modes_path)
+    return figure_paths
+
+
+def _write_interpretation_guide(
+    *,
+    spec: StudySpec,
+    paths_obj: StudyPaths,
+    summary_df: pd.DataFrame,
+    study_figure_paths: dict[str, str],
+) -> Path:
+    lines = [
+        f"# How To Read {paths_obj.study_name}",
+        "",
+        "This note is written automatically by the study runner. Use it as a quick reading guide for the figures, then write the thesis interpretation separately.",
+        "",
+        "## Core Metrics",
+        "",
+        "- `generated_summary.score_mean`: typical sample regularity. Higher is better.",
+        "- `generated_summary.score_p99`: best-tail quality. Higher means the method produces stronger rare samples.",
+        "- `score_threshold_rates.score_ge_0p7_rate`: share of samples clearing a high-quality regularity threshold.",
+        "- `distribution_distances.shape_distribution_shift_mean_normalized_w1`: shape-only manifold drift relative to the training/reference dataset. Lower is better.",
+        "- `generated_summary.self_intersection_rate`: explicit geometric invalidity rate. Lower is better.",
+        "",
+        "## Reading The Figures",
+        "",
+        "- `study_tradeoff.png`: lower-right is the preferred region because it combines higher score with lower shape drift.",
+    ]
+    if any(key.startswith("architecture_score_overlay__") for key in study_figure_paths):
+        lines.append("- `architecture_score_overlay__*.png`: compare the full score distributions, not just the mean. This is where tail advantages or mode shifts become visible.")
+    if any(key.startswith("architecture_metric_panel__") for key in study_figure_paths):
+        lines.append("- `architecture_metric_panel__*.png`: compare typical quality, tail quality, high-threshold success, and fidelity side by side for the architecture cases.")
+    if "guidance_schedule_sweep" in study_figure_paths:
+        lines.append("- `guidance_schedule_sweep.png`: isolates timing effects at fixed guidance strength. Look for schedules that improve score without sharply increasing shape drift.")
+    if "guidance_strength_sweep" in study_figure_paths:
+        lines.append("- `guidance_strength_sweep.png`: uses a wide dynamic range to show whether regularity guidance is monotonic, saturating, or destabilizing as scale increases.")
+    if "architecture_noise_sweep" in study_figure_paths:
+        lines.append("- `architecture_noise_sweep.png`: tests whether the architecture ranking changes as the training polygons become rougher.")
+    if "outlier_failure_modes" in study_figure_paths:
+        lines.append("- `outlier_failure_modes.png`: counts heuristic failure labels among the stored outlier set. Use this to distinguish high-score methods from low-degeneracy methods.")
+    lines.extend(
+        [
+            "",
+            "## Thesis Guardrail",
+            "",
+            "- Do not assume `mlp` wins by default.",
+            "- Treat `mlp > gnn` as a hypothesis to prove or reject using mean score, tail score, high-threshold rate, shape drift, and failure behavior together.",
+            "- A tradeoff result is acceptable: for example, `gat` may win on the score tail while `mlp` remains closer to the training manifold.",
+            "",
+            "## Guidance Guardrail",
+            "",
+            "- Regularity guidance is an aligned, relatively low-risk objective in this project.",
+            "- It is useful for studying controllability under favorable conditions, but it should not be presented as proof that arbitrary sampling-time guidance will behave equally well.",
+            "- The strength sweep is meant to locate the plateau and failure regime, not just the first improvement regime.",
+        ]
+    )
+    if not summary_df.empty and "case_name" in summary_df.columns:
+        lines.extend(
+            [
+                "",
+                "## Case Tags",
+                "",
+                "- The study runner uses `cases[*].tags` in the manifest to decide which grouped figures to build.",
+                "- For architecture studies, tag `architecture`, `dataset_noise`, and `analysis_group`.",
+                "- For guidance studies, tag `guidance_schedule`, `guidance_scale`, `analysis_group`, and set `guidance_baseline: true` on the unguided reference case.",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            f"Source manifest: `{spec.config_path}`",
+            "",
+        ]
+    )
+    guide_path = paths_obj.study_dir / "INTERPRET_RESULTS.md"
+    guide_path.parent.mkdir(parents=True, exist_ok=True)
+    guide_path.write_text("\n".join(lines), encoding="utf-8")
+    return guide_path
+
+
 def _write_sample_summary_outputs(
     *,
+    spec: StudySpec,
     paths_obj: StudyPaths,
     rows: list[dict[str, Any]],
     figure_paths_by_case: dict[str, dict[str, str]],
@@ -626,6 +943,8 @@ def _write_sample_summary_outputs(
             "summary_csv_path": None,
             "summary_json_path": None,
             "tradeoff_plot_path": None,
+            "study_figure_paths": {},
+            "interpretation_guide_path": None,
             "figure_paths_by_case": figure_paths_by_case,
         }
 
@@ -636,10 +955,21 @@ def _write_sample_summary_outputs(
     _write_json(summary_json_path, rows)
 
     tradeoff_path = _write_tradeoff_plot(summary_df, out_path=paths_obj.figures_dir / "study_tradeoff.png")
+    study_figure_paths = _write_analysis_figures(summary_df, paths_obj=paths_obj)
+    if tradeoff_path is not None:
+        study_figure_paths = {"study_tradeoff": str(tradeoff_path), **study_figure_paths}
+    interpretation_guide_path = _write_interpretation_guide(
+        spec=spec,
+        paths_obj=paths_obj,
+        summary_df=summary_df,
+        study_figure_paths=study_figure_paths,
+    )
     return {
         "summary_csv_path": str(summary_csv_path),
         "summary_json_path": str(summary_json_path),
         "tradeoff_plot_path": None if tradeoff_path is None else str(tradeoff_path),
+        "study_figure_paths": study_figure_paths,
+        "interpretation_guide_path": str(interpretation_guide_path),
         "figure_paths_by_case": figure_paths_by_case,
     }
 
@@ -659,6 +989,7 @@ def _summarize_sample_cases(
         row, figure_paths = _build_sample_case_summary_entry(
             spec=spec,
             paths_obj=paths_obj,
+            case=case,
             case_name=case.name,
             case_result=case_result,
         )
@@ -666,6 +997,7 @@ def _summarize_sample_cases(
         figure_paths_by_case[case.name] = figure_paths
         _write_case_report(
             paths_obj=paths_obj,
+            case=case,
             case_name=case.name,
             case_result=case_result,
             figure_paths=figure_paths,
@@ -673,6 +1005,7 @@ def _summarize_sample_cases(
         )
 
     summary_payload = _write_sample_summary_outputs(
+        spec=spec,
         paths_obj=paths_obj,
         rows=rows,
         figure_paths_by_case=figure_paths_by_case,
@@ -696,13 +1029,14 @@ def _ingest_case_result(
     case_results[case.name] = case_result
     _write_case_results(case_results_path, case_results)
 
-    case_report_path = _write_case_report(paths_obj=paths_obj, case_name=case.name, case_result=case_result)
+    case_report_path = _write_case_report(paths_obj=paths_obj, case=case, case_name=case.name, case_result=case_result)
     case_report_paths_by_case[case.name] = str(case_report_path)
 
     if case_result.get("case_kind") == "sample_diffusion":
         row, figure_paths = _build_sample_case_summary_entry(
             spec=spec,
             paths_obj=paths_obj,
+            case=case,
             case_name=case.name,
             case_result=case_result,
         )
@@ -710,6 +1044,7 @@ def _ingest_case_result(
         figure_paths_by_case[case.name] = figure_paths
         case_report_path = _write_case_report(
             paths_obj=paths_obj,
+            case=case,
             case_name=case.name,
             case_result=case_result,
             figure_paths=figure_paths,
@@ -717,6 +1052,7 @@ def _ingest_case_result(
         )
         case_report_paths_by_case[case.name] = str(case_report_path)
         return _write_sample_summary_outputs(
+            spec=spec,
             paths_obj=paths_obj,
             rows=sample_rows,
             figure_paths_by_case=figure_paths_by_case,
@@ -781,6 +1117,7 @@ def run_study_from_config(config_path: Path) -> Path:
     sample_rows: list[dict[str, Any]] = []
     figure_paths_by_case: dict[str, dict[str, str]] = {}
     summary_payload = _write_sample_summary_outputs(
+        spec=spec,
         paths_obj=paths_obj,
         rows=sample_rows,
         figure_paths_by_case=figure_paths_by_case,
@@ -1038,6 +1375,7 @@ def refresh_study_outputs(study_dir: Path) -> Path:
         summary_row = next((row for row in rows if row["case_name"] == case.name), None)
         case_report_path = _write_case_report(
             paths_obj=paths_obj,
+            case=case,
             case_name=case.name,
             case_result=case_result,
             figure_paths=figure_paths_by_case.get(case.name),

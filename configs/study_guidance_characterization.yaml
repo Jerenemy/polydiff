@@ -1,0 +1,461 @@
+# Controlled MLP guidance study for timing and strength characterization.
+# The strength sweep intentionally includes very large scales to find where
+# regularity guidance plateaus or starts damaging the sample distribution.
+# Run with:
+# python -m polydiff.studies.run --config configs/study_guidance_characterization.yaml
+
+study:
+  name: "guidance-characterization"
+  root_dir: "data/studies"
+  parallel:
+    enabled: false
+    max_workers: 3
+    require_cuda: true
+  summary:
+    reference_data_path: "data/raw/hexagons.npz"
+    representative_count: 12
+    outlier_count: 12
+    max_projection_points: 2000
+
+cases:
+  - name: "train-mlp"
+    kind: "train_diffusion"
+    config: "configs/train_diffusion.yaml"
+    tags:
+      stage: "train"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+    overrides:
+      data.path: "data/raw/hexagons.npz"
+      model.type: "mlp"
+      model.use_global_features: null
+
+  - name: "sample-mlp-unguided"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: false
+      guidance_schedule: "unguided"
+      guidance_scale: 0.0
+      guidance_baseline: true
+    overrides:
+      model.run: "{{train-mlp.run_name}}"
+      sampling.guidance:
+        enabled: false
+      sampling.restoration:
+        enabled: false
+      sampling.num_samples: 10000
+
+  - name: "sample-mlp-reg-all"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "guidance_schedule"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: true
+      guidance_schedule: "all"
+      guidance_scale: 2.0
+    overrides:
+      model.run: "{{train-mlp.run_name}}"
+      sampling.restoration:
+        enabled: false
+      sampling.guidance:
+        enabled: true
+        components:
+          - kind: "regularity"
+            scale: 2.0
+            schedule: "all"
+      sampling.num_samples: 10000
+
+  - name: "sample-mlp-reg-early"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "guidance_schedule"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: true
+      guidance_schedule: "early"
+      guidance_scale: 2.0
+    overrides:
+      model.run: "{{train-mlp.run_name}}"
+      sampling.restoration:
+        enabled: false
+      sampling.guidance:
+        enabled: true
+        components:
+          - kind: "regularity"
+            scale: 2.0
+            schedule: "early"
+      sampling.num_samples: 10000
+
+  - name: "sample-mlp-reg-mid"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "guidance_schedule"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: true
+      guidance_schedule: "mid"
+      guidance_scale: 2.0
+    overrides:
+      model.run: "{{train-mlp.run_name}}"
+      sampling.restoration:
+        enabled: false
+      sampling.guidance:
+        enabled: true
+        components:
+          - kind: "regularity"
+            scale: 2.0
+            schedule: "mid"
+      sampling.num_samples: 10000
+
+  - name: "sample-mlp-reg-late"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "guidance_schedule"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: true
+      guidance_schedule: "late"
+      guidance_scale: 2.0
+    overrides:
+      model.run: "{{train-mlp.run_name}}"
+      sampling.restoration:
+        enabled: false
+      sampling.guidance:
+        enabled: true
+        components:
+          - kind: "regularity"
+            scale: 2.0
+            schedule: "late"
+      sampling.num_samples: 10000
+
+  - name: "sample-mlp-reg-linear-ramp"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "guidance_schedule"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: true
+      guidance_schedule: "linear_ramp"
+      guidance_scale: 2.0
+    overrides:
+      model.run: "{{train-mlp.run_name}}"
+      sampling.restoration:
+        enabled: false
+      sampling.guidance:
+        enabled: true
+        components:
+          - kind: "regularity"
+            scale: 2.0
+            schedule: "linear_ramp"
+      sampling.num_samples: 10000
+
+  - name: "sample-mlp-reg-late-0p5"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "guidance_strength"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: true
+      guidance_schedule: "late"
+      guidance_scale: 0.5
+    overrides:
+      model.run: "{{train-mlp.run_name}}"
+      sampling.restoration:
+        enabled: false
+      sampling.guidance:
+        enabled: true
+        components:
+          - kind: "regularity"
+            scale: 0.5
+            schedule: "late"
+      sampling.num_samples: 10000
+
+  - name: "sample-mlp-reg-late-1p0"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "guidance_strength"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: true
+      guidance_schedule: "late"
+      guidance_scale: 1.0
+    overrides:
+      model.run: "{{train-mlp.run_name}}"
+      sampling.restoration:
+        enabled: false
+      sampling.guidance:
+        enabled: true
+        components:
+          - kind: "regularity"
+            scale: 1.0
+            schedule: "late"
+      sampling.num_samples: 10000
+
+  - name: "sample-mlp-reg-late-2p0"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "guidance_strength"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: true
+      guidance_schedule: "late"
+      guidance_scale: 2.0
+    overrides:
+      model.run: "{{train-mlp.run_name}}"
+      sampling.restoration:
+        enabled: false
+      sampling.guidance:
+        enabled: true
+        components:
+          - kind: "regularity"
+            scale: 2.0
+            schedule: "late"
+      sampling.num_samples: 10000
+
+  - name: "sample-mlp-reg-late-4p0"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "guidance_strength"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: true
+      guidance_schedule: "late"
+      guidance_scale: 4.0
+    overrides:
+      model.run: "{{train-mlp.run_name}}"
+      sampling.restoration:
+        enabled: false
+      sampling.guidance:
+        enabled: true
+        components:
+          - kind: "regularity"
+            scale: 4.0
+            schedule: "late"
+      sampling.num_samples: 10000
+
+  - name: "sample-mlp-reg-late-8p0"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "guidance_strength"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: true
+      guidance_schedule: "late"
+      guidance_scale: 8.0
+    overrides:
+      model.run: "{{train-mlp.run_name}}"
+      sampling.restoration:
+        enabled: false
+      sampling.guidance:
+        enabled: true
+        components:
+          - kind: "regularity"
+            scale: 8.0
+            schedule: "late"
+      sampling.num_samples: 10000
+
+  - name: "sample-mlp-reg-late-16"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "guidance_strength"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: true
+      guidance_schedule: "late"
+      guidance_scale: 16.0
+    overrides:
+      model.run: "{{train-mlp.run_name}}"
+      sampling.restoration:
+        enabled: false
+      sampling.guidance:
+        enabled: true
+        components:
+          - kind: "regularity"
+            scale: 16.0
+            schedule: "late"
+      sampling.num_samples: 10000
+
+  - name: "sample-mlp-reg-late-32"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "guidance_strength"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: true
+      guidance_schedule: "late"
+      guidance_scale: 32.0
+    overrides:
+      model.run: "{{train-mlp.run_name}}"
+      sampling.restoration:
+        enabled: false
+      sampling.guidance:
+        enabled: true
+        components:
+          - kind: "regularity"
+            scale: 32.0
+            schedule: "late"
+      sampling.num_samples: 10000
+
+  - name: "sample-mlp-reg-late-64"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "guidance_strength"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: true
+      guidance_schedule: "late"
+      guidance_scale: 64.0
+    overrides:
+      model.run: "{{train-mlp.run_name}}"
+      sampling.restoration:
+        enabled: false
+      sampling.guidance:
+        enabled: true
+        components:
+          - kind: "regularity"
+            scale: 64.0
+            schedule: "late"
+      sampling.num_samples: 10000
+
+  - name: "sample-mlp-reg-late-128"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "guidance_strength"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: true
+      guidance_schedule: "late"
+      guidance_scale: 128.0
+    overrides:
+      model.run: "{{train-mlp.run_name}}"
+      sampling.restoration:
+        enabled: false
+      sampling.guidance:
+        enabled: true
+        components:
+          - kind: "regularity"
+            scale: 128.0
+            schedule: "late"
+      sampling.num_samples: 10000
+
+  - name: "sample-mlp-reg-late-256"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "guidance_strength"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: true
+      guidance_schedule: "late"
+      guidance_scale: 256.0
+    overrides:
+      model.run: "{{train-mlp.run_name}}"
+      sampling.restoration:
+        enabled: false
+      sampling.guidance:
+        enabled: true
+        components:
+          - kind: "regularity"
+            scale: 256.0
+            schedule: "late"
+      sampling.num_samples: 10000
+
+  - name: "sample-mlp-reg-late-512"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "guidance_strength"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: true
+      guidance_schedule: "late"
+      guidance_scale: 512.0
+    overrides:
+      model.run: "{{train-mlp.run_name}}"
+      sampling.restoration:
+        enabled: false
+      sampling.guidance:
+        enabled: true
+        components:
+          - kind: "regularity"
+            scale: 512.0
+            schedule: "late"
+      sampling.num_samples: 10000
+
+  - name: "sample-mlp-reg-late-1000"
+    kind: "sample_diffusion"
+    config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "guidance_strength"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: true
+      guidance_schedule: "late"
+      guidance_scale: 1000.0
+    overrides:
+      model.run: "{{train-mlp.run_name}}"
+      sampling.restoration:
+        enabled: false
+      sampling.guidance:
+        enabled: true
+        components:
+          - kind: "regularity"
+            scale: 1000.0
+            schedule: "late"
+      sampling.num_samples: 10000

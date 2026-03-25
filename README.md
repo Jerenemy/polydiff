@@ -229,6 +229,14 @@ Use the study runner when you want a reproducible thesis-style sweep instead of 
 python -m polydiff.studies.run --config configs/study_minimum_high_honors.yaml
 ```
 
+Other thesis-oriented manifests:
+
+```bash
+python scripts/generate_data/generate_thesis_datasets.py
+python -m polydiff.studies.run --config configs/study_guidance_characterization.yaml
+python -m polydiff.studies.run --config configs/study_architecture_noise_sweep.yaml
+```
+
 Set `study.parallel.enabled: true` when you want the study runner to launch dependency-independent cases in parallel. By default that mode only activates when CUDA is available; use `study.parallel.require_cuda: false` if you intentionally want the same scheduler on CPU.
 
 Study cases can:
@@ -242,7 +250,15 @@ Each study writes a numbered folder under `data/studies/` containing:
 - resolved per-case configs
 - case result metadata
 - sample-case summary CSV/JSON
+- `INTERPRET_RESULTS.md`, an auto-written guide to reading the study figures
 - score-distribution, PCA, representative-sample, and outlier galleries when reference data is available
+- grouped comparison figures when cases are tagged in the manifest:
+  - architecture score overlays
+  - architecture metric panels
+  - guidance timing sweeps
+  - guidance strength sweeps, including extreme-scale stress tests
+  - architecture-vs-dataset-noise sweeps
+  - outlier failure-mode summaries
 
 The study manifest supports placeholder references such as `{{train-mlp.run_name}}` so later cases can consume earlier outputs.
 - `data/processed/run_####__.../sample_0001__.../media/animations/sample_0000.gif` and friends when animation export is enabled
@@ -251,6 +267,19 @@ The study manifest supports placeholder references such as `{{train-mlp.run_name
 If you sample from the same model run multiple times, each invocation gets a new `sample_####__...` directory. That keeps unguided, guided, and parameter-sweep sampling outputs from overwriting each other.
 
 The diagnostics JSON compares generated samples against the training reference distribution when that reference is available from the checkpoint or explicitly configured.
+
+The guidance characterization study uses analytic regularity guidance as an intentionally aligned objective. That makes it a good controllability probe, but also a favorable case: if you write about those results, frame them as evidence about guidance under a low-conflict objective rather than as proof that arbitrary guidance behaves the same way.
+
+For the thesis-oriented training-data comparison, `scripts/generate_data/generate_thesis_datasets.py` writes three fixed-size hexagon presets:
+
+- `baseline`: the default `hexagons.npz`
+- `noisy`: `hexagons_noisy.npz`
+- `very_noisy`: `hexagons_very_noisy.npz`
+
+That lets you ask a sharper question than "is MLP best?":
+
+- does `mlp` still dominate when the training set becomes rougher?
+- or does a graph model recover an advantage on the higher-noise manifold?
 
 Sample file formats:
 

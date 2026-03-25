@@ -19,6 +19,12 @@ cases:
   - name: "train-mlp"
     kind: "train_diffusion"
     config: "configs/train_diffusion.yaml"
+    tags:
+      stage: "train"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
     overrides:
       data.path: "data/raw/hexagons.npz"
       model.type: "mlp"
@@ -27,6 +33,12 @@ cases:
   - name: "train-gcn"
     kind: "train_diffusion"
     config: "configs/train_diffusion.yaml"
+    tags:
+      stage: "train"
+      architecture: "gcn"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
     overrides:
       data.path: "data/raw/hexagons.npz"
       model.type: "gcn"
@@ -35,6 +47,12 @@ cases:
   - name: "train-gat"
     kind: "train_diffusion"
     config: "configs/train_diffusion.yaml"
+    tags:
+      stage: "train"
+      architecture: "gat"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
     overrides:
       data.path: "data/raw/hexagons.npz"
       model.type: "gat"
@@ -43,6 +61,15 @@ cases:
   - name: "sample-mlp-unguided"
     kind: "sample_diffusion"
     config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "architecture_baseline"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: false
+      guidance_schedule: "unguided"
+      guidance_scale: 0.0
     overrides:
       model.run: "{{train-mlp.run_name}}"
       sampling.guidance:
@@ -54,6 +81,15 @@ cases:
   - name: "sample-gcn-unguided"
     kind: "sample_diffusion"
     config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "architecture_baseline"
+      architecture: "gcn"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: false
+      guidance_schedule: "unguided"
+      guidance_scale: 0.0
     overrides:
       model.run: "{{train-gcn.run_name}}"
       sampling.guidance:
@@ -65,6 +101,15 @@ cases:
   - name: "sample-gat-unguided"
     kind: "sample_diffusion"
     config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "architecture_baseline"
+      architecture: "gat"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: false
+      guidance_schedule: "unguided"
+      guidance_scale: 0.0
     overrides:
       model.run: "{{train-gat.run_name}}"
       sampling.guidance:
@@ -76,6 +121,15 @@ cases:
   - name: "sample-mlp-reg-weak"
     kind: "sample_diffusion"
     config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "guidance_prototype"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: true
+      guidance_schedule: "all"
+      guidance_scale: 0.5
     overrides:
       model.run: "{{train-mlp.run_name}}"
       sampling.restoration:
@@ -91,6 +145,15 @@ cases:
   - name: "sample-mlp-reg-late"
     kind: "sample_diffusion"
     config: "configs/sample_diffusion.yaml"
+    tags:
+      analysis_group: "guidance_prototype"
+      architecture: "mlp"
+      dataset_family: "hexagons"
+      dataset_noise: "baseline"
+      dataset_noise_rank: 1
+      guidance_enabled: true
+      guidance_schedule: "late"
+      guidance_scale: 2.0
     overrides:
       model.run: "{{train-mlp.run_name}}"
       sampling.restoration:

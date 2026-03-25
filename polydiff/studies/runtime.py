@@ -39,6 +39,7 @@ class StudyCase:
     kind: str
     config_path: Path
     overrides: dict[str, Any]
+    tags: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,12 +140,18 @@ def load_study_spec(config_path: Path) -> StudySpec:
             overrides = {}
         if not isinstance(overrides, dict):
             raise ValueError(f"study case {name!r} overrides must be a mapping")
+        tags = case_cfg.get("tags", {})
+        if tags is None:
+            tags = {}
+        if not isinstance(tags, dict):
+            raise ValueError(f"study case {name!r} tags must be a mapping")
         cases.append(
             StudyCase(
                 name=name,
                 kind=kind,
                 config_path=resolve_project_path(case_config),
                 overrides=dict(overrides),
+                tags=dict(tags),
             )
         )
 
@@ -274,6 +281,7 @@ def write_study_metadata(path: Path, *, spec: StudySpec, paths_obj: StudyPaths) 
                 "kind": case.kind,
                 "config_path": str(case.config_path),
                 "overrides": case.overrides,
+                "tags": case.tags,
             }
             for case in spec.cases
         ],

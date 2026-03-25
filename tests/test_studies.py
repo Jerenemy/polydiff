@@ -9,6 +9,7 @@ import yaml
 
 from polydiff.data.diagnostics import (
     compare_polygon_metric_tables,
+    outlier_failure_mode_summary,
     outlier_polygon_indices,
     polygon_metric_table,
     representative_polygon_indices,
@@ -17,6 +18,7 @@ from polydiff.data.diagnostics import (
 from polydiff.data.polygon_dataset import load_polygon_dataset
 from polydiff.data.gen_polygons import batch
 from polydiff.models.diffusion import build_denoiser
+from polydiff.studies.plots import save_metric_sweep_figure
 from polydiff.studies.run import _add_tradeoff_labels, refresh_study_outputs, run_study_from_config
 from polydiff.studies.runtime import apply_dotted_overrides, load_study_spec, resolve_case_placeholders
 
@@ -94,6 +96,37 @@ def test_load_study_spec_parses_parallel_options(tmp_path):
     assert spec.parallel.require_cuda is False
 
 
+def test_load_study_spec_parses_case_tags(tmp_path):
+    sample_config_path = tmp_path / "sample.yaml"
+    sample_config_path.write_text("sampling:\n  num_samples: 4\n", encoding="utf-8")
+    config_path = tmp_path / "study_tags.yaml"
+    with open(config_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(
+            {
+                "study": {"name": "tagged-study"},
+                "cases": [
+                    {
+                        "name": "sample-a",
+                        "kind": "sample_diffusion",
+                        "config": str(sample_config_path),
+                        "tags": {
+                            "analysis_group": "architecture_baseline",
+                            "architecture": "mlp",
+                            "dataset_noise": "baseline",
+                        },
+                    }
+                ],
+            },
+            f,
+            sort_keys=False,
+        )
+
+    spec = load_study_spec(config_path)
+
+    assert spec.cases[0].tags["analysis_group"] == "architecture_baseline"
+    assert spec.cases[0].tags["architecture"] == "mlp"
+
+
 def test_tradeoff_label_layout_avoids_overlap_for_close_points():
     summary_df = pd.DataFrame(
         [
@@ -135,6 +168,60 @@ def test_tradeoff_label_layout_avoids_overlap_for_close_points():
         for other in boxes[index + 1 :]:
             assert not bbox.overlaps(other)
     plt.close(fig)
+
+
+def test_metric_sweep_figure_supports_symlog_strength_axis(tmp_path):
+    summary_df = pd.DataFrame(
+        [
+            {
+                "case_tags.guidance_scale": 0.0,
+                "generated_summary.score_mean": 0.41,
+                "generated_summary.score_p99": 0.72,
+                "score_threshold_rates.score_ge_0p7_rate": 0.02,
+                "distribution_distances.shape_distribution_shift_mean_normalized_w1": 0.40,
+            },
+            {
+                "case_tags.guidance_scale": 1.0,
+                "generated_summary.score_mean": 0.43,
+                "generated_summary.score_p99": 0.76,
+                "score_threshold_rates.score_ge_0p7_rate": 0.04,
+                "distribution_distances.shape_distribution_shift_mean_normalized_w1": 0.38,
+            },
+            {
+                "case_tags.guidance_scale": 1000.0,
+                "generated_summary.score_mean": 0.39,
+                "generated_summary.score_p99": 0.63,
+                "score_threshold_rates.score_ge_0p7_rate": 0.01,
+                "distribution_distances.shape_distribution_shift_mean_normalized_w1": 1.50,
+            },
+        ]
+    )
+
+    out_path = tmp_path / "guidance_strength_sweep.png"
+    result = save_metric_sweep_figure(
+        summary_df,
+        out_path,
+        x_key="case_tags.guidance_scale",
+        x_label="guidance scale",
+        x_scale="symlog",
+        title="Guidance Strength Sweep",
+    )
+
+    assert result == out_path
+    assert out_path.exists()
+
+
+def test_outlier_failure_mode_summary_counts_self_intersections():
+    reference_coords, _, _ = batch(n=6, num=24, seed=0, radial_sigma=0.10, angle_sigma=0.05, smooth_passes=4)
+    reference_table = polygon_metric_table(reference_coords)
+
+    observed_table = reference_table.copy()
+    observed_table.loc[0, "self_intersection"] = 1.0
+    summary = outlier_failure_mode_summary(reference_table, observed_table, outlier_indices=[0, 1, 2])
+
+    assert summary["outlier_count"] == 3
+    assert summary["self_intersection_count"] == 1
+    assert summary["self_intersection_rate"] == 1.0 / 3.0
 
 
 def test_run_study_from_config_executes_sample_case_and_writes_reports(tmp_path):
@@ -226,9 +313,11 @@ def test_run_study_from_config_executes_sample_case_and_writes_reports(tmp_path)
     summary_csv_path = Path(report_payload["summary_csv_path"])
     summary_json_path = Path(report_payload["summary_json_path"])
     case_results_path = Path(report_payload["case_results_path"])
+    interpretation_guide_path = Path(report_payload["interpretation_guide_path"])
     assert summary_csv_path.exists()
     assert summary_json_path.exists()
     assert case_results_path.exists()
+    assert interpretation_guide_path.exists()
     figure_paths = report_payload["figure_paths_by_case"]["sample-unguided"]
     case_report_path = Path(report_payload["case_report_paths_by_case"]["sample-unguided"])
     assert case_report_path.exists()
@@ -268,6 +357,8 @@ def test_run_study_from_config_executes_sample_case_and_writes_reports(tmp_path)
 
     refreshed_summary_df = pd.read_csv(Path(refreshed_report_payload["summary_csv_path"]))
     assert "distribution_distances.shape_distribution_shift_mean_normalized_w1" in refreshed_summary_df.columns
+    assert "generated_summary.score_p99" in refreshed_summary_df.columns
+    assert "score_threshold_rates.score_ge_0p7_rate" in refreshed_summary_df.columns
 
 
 def test_run_study_from_config_supports_parallel_case_execution(tmp_path):
@@ -343,6 +434,12 @@ def test_run_study_from_config_supports_parallel_case_execution(tmp_path):
                         "name": "sample-a",
                         "kind": "sample_diffusion",
                         "config": str(sample_config_path),
+                        "tags": {
+                            "analysis_group": "architecture_baseline",
+                            "architecture": "mlp",
+                            "dataset_noise": "baseline",
+                            "guidance_schedule": "unguided",
+                        },
                         "overrides": {
                             "model.checkpoint": str(checkpoint_path),
                             "sampling.out_path": str(tmp_path / "sample_a.npz"),
@@ -352,6 +449,12 @@ def test_run_study_from_config_supports_parallel_case_execution(tmp_path):
                         "name": "sample-b",
                         "kind": "sample_diffusion",
                         "config": str(sample_config_path),
+                        "tags": {
+                            "analysis_group": "architecture_baseline",
+                            "architecture": "gat",
+                            "dataset_noise": "baseline",
+                            "guidance_schedule": "unguided",
+                        },
                         "overrides": {
                             "model.checkpoint": str(checkpoint_path),
                             "sampling.out_path": str(tmp_path / "sample_b.npz"),
@@ -370,6 +473,9 @@ def test_run_study_from_config_supports_parallel_case_execution(tmp_path):
     assert report_payload["status"] == "completed"
     assert report_payload["parallel"]["enabled"] is True
     assert report_payload["current_case_names"] == []
+    assert Path(report_payload["interpretation_guide_path"]).exists()
+    assert Path(report_payload["study_figure_paths"]["architecture_score_overlay__baseline"]).exists()
+    assert Path(report_payload["study_figure_paths"]["architecture_metric_panel__baseline"]).exists()
 
     case_results_path = Path(report_payload["case_results_path"])
     with open(case_results_path, "r", encoding="utf-8") as f:
