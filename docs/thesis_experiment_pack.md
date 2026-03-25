@@ -13,9 +13,10 @@ The same caution applies to guidance: the current guidance study uses analytic r
 
 1. `configs/study_minimum_high_honors.yaml`
 2. `configs/study_guidance_characterization.yaml`
-3. `configs/study_architecture_noise_sweep.yaml`
+3. `configs/study_distribution_fidelity.yaml`
+4. `configs/study_architecture_noise_sweep.yaml`
 
-The first study is the minimum package. The second isolates guidance timing and strength and now deliberately pushes regularity guidance into the plateau and breakdown regime with very large scales. The third tests whether architecture rankings change when the training polygons become noisier.
+The first study is the minimum package. The second isolates guidance timing and strength and now deliberately pushes regularity guidance into the plateau and breakdown regime with very large scales. The third asks which architecture best matches the baseline training distribution and whether guidance acts like a correction or a distortion for that architecture. The fourth tests whether architecture rankings change when the training polygons become noisier.
 
 ## Training Dataset Presets
 
@@ -41,6 +42,7 @@ The presets are:
 - `guidance_schedule_sweep.png`: identify whether timing changes help at fixed scale.
 - `guidance_strength_sweep.png`: identify whether guidance is monotonic, saturating, or destabilizing.
 - because the strength sweep now reaches very large scales, this figure should be read as a plateau/breakdown search rather than just a local tuning curve.
+- `distribution_guidance_sweep.png`: compare whether increasing guidance scale moves each architecture toward or away from the training distribution while also changing score quality.
 - `architecture_noise_sweep.png`: test whether more difficult training data changes the architecture ranking.
 - `outlier_failure_modes.png`: compare where the worst samples fail.
 

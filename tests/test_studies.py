@@ -361,6 +361,166 @@ def test_run_study_from_config_executes_sample_case_and_writes_reports(tmp_path)
     assert "score_threshold_rates.score_ge_0p7_rate" in refreshed_summary_df.columns
 
 
+def test_run_study_writes_distribution_guidance_sweep(tmp_path):
+    reference_coords, _, _ = batch(n=4, num=24, seed=9, radial_sigma=0.10, angle_sigma=0.05, smooth_passes=4)
+    reference_path = tmp_path / "reference.npz"
+    np.savez_compressed(reference_path, coords=reference_coords.astype(np.float32), n=np.int32(4))
+
+    model = build_denoiser(
+        data_dim=8,
+        model_cfg={
+            "type": "mlp",
+            "hidden_dim": 16,
+            "time_emb_dim": 8,
+            "num_layers": 1,
+        },
+    )
+    checkpoint_path = tmp_path / "diffusion_checkpoint.pt"
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "diffusion": {"n_steps": 4, "beta_start": 1e-4, "beta_end": 2e-2},
+            "model_cfg": {"type": "mlp", "hidden_dim": 16, "time_emb_dim": 8, "num_layers": 1},
+            "n_vertices": 4,
+            "max_vertices": 4,
+            "global_step": 0,
+            "run_name": None,
+            "training_data_path": str(reference_path),
+            "training_data_summary": summarize_polygon_dataset(reference_coords),
+        },
+        checkpoint_path,
+    )
+
+    sample_config_path = tmp_path / "sample_guidance_compare.yaml"
+    with open(sample_config_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(
+            {
+                "experiment_name": "distribution-guidance-study",
+                "seed": 0,
+                "device": "cpu",
+                "model": {},
+                "sampling": {
+                    "num_samples": 4,
+                    "guidance": {"enabled": False},
+                    "restoration": {"enabled": False},
+                    "diagnostics": {"enabled": True, "reference_data_path": str(reference_path)},
+                },
+            },
+            f,
+            sort_keys=False,
+        )
+
+    study_config_path = tmp_path / "study_distribution_guidance.yaml"
+    with open(study_config_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(
+            {
+                "study": {
+                    "name": "distribution-guidance-study",
+                    "root_dir": str(tmp_path / "studies"),
+                    "summary": {
+                        "reference_data_path": str(reference_path),
+                        "representative_count": 4,
+                        "outlier_count": 4,
+                        "max_projection_points": 128,
+                    },
+                },
+                "cases": [
+                    {
+                        "name": "sample-mlp-unguided",
+                        "kind": "sample_diffusion",
+                        "config": str(sample_config_path),
+                        "tags": {
+                            "analysis_group": "architecture_baseline",
+                            "architecture": "mlp",
+                            "guidance_schedule": "unguided",
+                            "guidance_scale": 0.0,
+                            "guidance_baseline": True,
+                        },
+                        "overrides": {
+                            "model.checkpoint": str(checkpoint_path),
+                            "sampling.out_path": str(tmp_path / "sample_mlp_unguided.npz"),
+                        },
+                    },
+                    {
+                        "name": "sample-gat-unguided",
+                        "kind": "sample_diffusion",
+                        "config": str(sample_config_path),
+                        "tags": {
+                            "analysis_group": "architecture_baseline",
+                            "architecture": "gat",
+                            "guidance_schedule": "unguided",
+                            "guidance_scale": 0.0,
+                            "guidance_baseline": True,
+                        },
+                        "overrides": {
+                            "model.checkpoint": str(checkpoint_path),
+                            "sampling.out_path": str(tmp_path / "sample_gat_unguided.npz"),
+                        },
+                    },
+                    {
+                        "name": "sample-mlp-guided",
+                        "kind": "sample_diffusion",
+                        "config": str(sample_config_path),
+                        "tags": {
+                            "analysis_group": "distribution_guidance",
+                            "architecture": "mlp",
+                            "guidance_schedule": "late",
+                            "guidance_scale": 2.0,
+                        },
+                        "overrides": {
+                            "model.checkpoint": str(checkpoint_path),
+                            "sampling.out_path": str(tmp_path / "sample_mlp_guided.npz"),
+                            "sampling.guidance": {
+                                "enabled": True,
+                                "components": [
+                                    {
+                                        "kind": "regularity",
+                                        "scale": 2.0,
+                                        "schedule": "late",
+                                    }
+                                ],
+                            },
+                        },
+                    },
+                    {
+                        "name": "sample-gat-guided",
+                        "kind": "sample_diffusion",
+                        "config": str(sample_config_path),
+                        "tags": {
+                            "analysis_group": "distribution_guidance",
+                            "architecture": "gat",
+                            "guidance_schedule": "late",
+                            "guidance_scale": 2.0,
+                        },
+                        "overrides": {
+                            "model.checkpoint": str(checkpoint_path),
+                            "sampling.out_path": str(tmp_path / "sample_gat_guided.npz"),
+                            "sampling.guidance": {
+                                "enabled": True,
+                                "components": [
+                                    {
+                                        "kind": "regularity",
+                                        "scale": 2.0,
+                                        "schedule": "late",
+                                    }
+                                ],
+                            },
+                        },
+                    },
+                ],
+            },
+            f,
+            sort_keys=False,
+        )
+
+    report_path = run_study_from_config(study_config_path)
+    with open(report_path, "r", encoding="utf-8") as f:
+        report_payload = json.load(f)
+
+    assert report_payload["status"] == "completed"
+    assert Path(report_payload["study_figure_paths"]["distribution_guidance_sweep"]).exists()
+
+
 def test_run_study_from_config_supports_parallel_case_execution(tmp_path):
     reference_coords, _, _ = batch(n=4, num=16, seed=11, radial_sigma=0.08, angle_sigma=0.04, smooth_passes=4)
     reference_path = tmp_path / "reference.npz"

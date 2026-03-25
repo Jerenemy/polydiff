@@ -235,6 +235,7 @@ Other thesis-oriented manifests:
 python scripts/generate_data/generate_thesis_datasets.py
 python -m polydiff.studies.run --config configs/study_guidance_characterization.yaml
 python -m polydiff.studies.run --config configs/study_architecture_noise_sweep.yaml
+python -m polydiff.studies.run --config configs/study_distribution_fidelity.yaml
 ```
 
 Set `study.parallel.enabled: true` when you want the study runner to launch dependency-independent cases in parallel. By default that mode only activates when CUDA is available; use `study.parallel.require_cuda: false` if you intentionally want the same scheduler on CPU.
@@ -257,6 +258,7 @@ Each study writes a numbered folder under `data/studies/` containing:
   - architecture metric panels
   - guidance timing sweeps
   - guidance strength sweeps, including extreme-scale stress tests
+  - architecture-by-guidance distribution-fidelity sweeps
   - architecture-vs-dataset-noise sweeps
   - outlier failure-mode summaries
 

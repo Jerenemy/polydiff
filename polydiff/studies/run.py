@@ -825,6 +825,29 @@ def _write_analysis_figures(summary_df: pd.DataFrame, *, paths_obj: StudyPaths) 
         if strength_path is not None:
             figure_paths["guidance_strength_sweep"] = str(strength_path)
 
+    distribution_guidance_frame = _frame_for_analysis_group(
+        summary_df,
+        analysis_group="distribution_guidance",
+        include_guidance_baseline=True,
+    )
+    if (
+        not distribution_guidance_frame.empty
+        and "case_tags.guidance_scale" in distribution_guidance_frame.columns
+        and "case_tags.architecture" in distribution_guidance_frame.columns
+    ):
+        distribution_guidance_path = save_metric_sweep_figure(
+            distribution_guidance_frame,
+            paths_obj.figures_dir / "distribution_guidance_sweep.png",
+            x_key="case_tags.guidance_scale",
+            x_label="guidance scale",
+            x_scale="symlog",
+            group_key="case_tags.architecture",
+            group_order=architecture_order or None,
+            title="Guidance Scale vs Distribution Fidelity",
+        )
+        if distribution_guidance_path is not None:
+            figure_paths["distribution_guidance_sweep"] = str(distribution_guidance_path)
+
     noise_frame = _frame_for_analysis_group(summary_df, analysis_group="architecture_noise")
     if (
         not noise_frame.empty
@@ -887,6 +910,8 @@ def _write_interpretation_guide(
         lines.append("- `guidance_schedule_sweep.png`: isolates timing effects at fixed guidance strength. Look for schedules that improve score without sharply increasing shape drift.")
     if "guidance_strength_sweep" in study_figure_paths:
         lines.append("- `guidance_strength_sweep.png`: uses a wide dynamic range to show whether regularity guidance is monotonic, saturating, or destabilizing as scale increases.")
+    if "distribution_guidance_sweep" in study_figure_paths:
+        lines.append("- `distribution_guidance_sweep.png`: compares whether increasing guidance scale pulls each architecture toward the training distribution or pushes it away while changing score quality.")
     if "architecture_noise_sweep" in study_figure_paths:
         lines.append("- `architecture_noise_sweep.png`: tests whether the architecture ranking changes as the training polygons become rougher.")
     if "outlier_failure_modes" in study_figure_paths:

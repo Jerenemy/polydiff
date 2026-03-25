@@ -10,6 +10,7 @@ Main files:
 - `study_minimum_high_honors.yaml`: example multi-case study manifest
 - `study_guidance_characterization.yaml`: controlled MLP schedule/strength sweep, including extreme-scale regularity stress tests
 - `study_architecture_noise_sweep.yaml`: architecture comparison across noisier training datasets
+- `study_distribution_fidelity.yaml`: baseline-distribution study comparing unguided and guided architecture fidelity
 
 Important compatibility rules:
 
@@ -55,6 +56,7 @@ When those tags are present, the study runner can emit:
 - combined architecture score overlays
 - architecture metric panels
 - guidance timing and strength sweeps
+- architecture-by-guidance fidelity sweeps
 - architecture-vs-noise sweeps
 - a heuristic outlier failure-mode figure
 
