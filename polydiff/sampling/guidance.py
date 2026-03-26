@@ -35,12 +35,7 @@ class ClassifierGuidance:
         self.classifier.eval()
         with torch.enable_grad():
             x_in = x_t.detach().requires_grad_(True)
-            if graph_batch is None:
-                classifier_input = x_in
-            else:
-                expected_data_dim = getattr(getattr(self.classifier, "trunk", None), "data_dim", None)
-                classifier_input = _graph_batch_dense_input(x_in, graph_batch, expected_data_dim=expected_data_dim)
-            logits = self.classifier(classifier_input, t)
+            logits = self.classifier(x_in, t, batch=graph_batch)
             if logits.ndim != 2:
                 raise ValueError(f"classifier logits must have shape (batch, num_classes), got {tuple(logits.shape)}")
             if not 0 <= self.target_class < logits.shape[1]:
@@ -69,12 +64,7 @@ class RegressorGuidance:
         self.regressor.eval()
         with torch.enable_grad():
             x_in = x_t.detach().requires_grad_(True)
-            if graph_batch is None:
-                regressor_input = x_in
-            else:
-                expected_data_dim = getattr(getattr(self.regressor, "trunk", None), "data_dim", None)
-                regressor_input = _graph_batch_dense_input(x_in, graph_batch, expected_data_dim=expected_data_dim)
-            pred = self.regressor(regressor_input, t)
+            pred = self.regressor(x_in, t, batch=graph_batch)
             if pred.ndim == 2 and pred.shape[1] == 1:
                 pred = pred[:, 0]
             elif pred.ndim != 1:
@@ -347,24 +337,6 @@ def _restoration_timestep_weight(
     return float(min_timestep_weight) + (1.0 - float(min_timestep_weight)) * progress.pow(float(timestep_power))
 
 
-def _graph_batch_dense_input(
-    x_t: torch.Tensor,
-    graph_batch: PolygonGraphBatch,
-    *,
-    expected_data_dim: int | None,
-) -> torch.Tensor:
-    if x_t.ndim != 2 or x_t.shape != (graph_batch.total_vertices, 2):
-        raise ValueError(
-            f"x_t must have shape ({graph_batch.total_vertices}, 2) for graph guidance, got {tuple(x_t.shape)}"
-        )
-    n_vertices = graph_batch.uniform_num_vertices()
-    if expected_data_dim is not None and expected_data_dim != n_vertices * 2:
-        raise ValueError(
-            f"checkpoint-backed guidance expects data_dim={expected_data_dim}, but graph batch has n_vertices={n_vertices}"
-        )
-    return x_t.reshape(graph_batch.batch_size, n_vertices * 2)
-
-
 def load_sampling_guidance(
     checkpoint_path: Path | None,
     *,
@@ -480,7 +452,12 @@ def load_sampling_guidance(
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     checkpoint_model_cfg = dict(checkpoint.get("model_cfg", {}))
     checkpoint_model_cfg.setdefault("type", "mlp")
-    n_vertices = int(checkpoint.get("n_vertices", 6))
+    checkpoint_model_type = str(checkpoint_model_cfg.get("type", "mlp")).lower()
+    max_vertices = int(checkpoint.get("max_vertices", checkpoint.get("n_vertices", 6)))
+    checkpoint_n_vertices = checkpoint.get("n_vertices")
+    guidance_n_vertices = (
+        None if checkpoint_model_type != "mlp" or checkpoint_n_vertices is None else int(checkpoint_n_vertices)
+    )
 
     checkpoint_task = checkpoint.get("guidance_task")
     if checkpoint_task is not None and str(checkpoint_task).lower() != task:
@@ -492,7 +469,7 @@ def load_sampling_guidance(
         num_classes = int(checkpoint.get("num_classes", 2))
         classifier = build_guidance_model(
             task="classifier",
-            data_dim=n_vertices * 2,
+            data_dim=max_vertices * 2,
             model_cfg=checkpoint_model_cfg,
             num_classes=num_classes,
         )
@@ -505,12 +482,12 @@ def load_sampling_guidance(
             target_class=1 if target_class is None else int(target_class),
         )
         checkpoint, guidance = _wrap_schedule(dict(checkpoint), guidance)
-        return checkpoint, guidance, n_vertices
+        return checkpoint, guidance, guidance_n_vertices
 
     if task == "regressor":
         regressor = build_guidance_model(
             task="regressor",
-            data_dim=n_vertices * 2,
+            data_dim=max_vertices * 2,
             model_cfg=checkpoint_model_cfg,
         )
         regressor.load_state_dict(checkpoint["model_state"])
@@ -522,7 +499,7 @@ def load_sampling_guidance(
             target_value=None if target_value is None else float(target_value),
         )
         checkpoint, guidance = _wrap_schedule(dict(checkpoint), guidance)
-        return checkpoint, guidance, n_vertices
+        return checkpoint, guidance, guidance_n_vertices
 
     raise ValueError(
         f"Unsupported guidance kind {kind!r}; expected one of: classifier, regressor, regularity, area, restoration"
@@ -537,7 +514,7 @@ def load_guidance_from_checkpoint(
     scale: float,
     target_class: int | None = None,
     target_value: float | None = None,
-) -> tuple[dict[str, Any], ClassifierGuidance | RegressorGuidance, int]:
+) -> tuple[dict[str, Any], ClassifierGuidance | RegressorGuidance, int | None]:
     checkpoint, guidance, n_vertices = load_sampling_guidance(
         checkpoint_path,
         device=device,

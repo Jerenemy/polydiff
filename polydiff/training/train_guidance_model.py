@@ -10,11 +10,11 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 
 from .. import paths
 from ..data.gen_polygons import regularity_score
-from ..data.polygon_dataset import load_polygon_dataset
+from ..data.polygon_dataset import PolygonGraphBatch, collate_polygon_graph_batch, load_polygon_dataset
 from ..models.guidance_models import build_guidance_model
 from ..models.diffusion import Diffusion, DiffusionConfig
 from ..utils.runtime import device_from_config, load_yaml_config, resolve_project_path, set_seed
@@ -35,10 +35,33 @@ class _UnusedDenoiser(nn.Module):
         raise RuntimeError("_UnusedDenoiser.forward should never be called")
 
 
-def _load_scores(coords: np.ndarray, npz_data: np.lib.npyio.NpzFile) -> np.ndarray:
+class _PolygonTargetDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
+    def __init__(self, polygon_data, targets: np.ndarray) -> None:
+        self.polygon_data = polygon_data
+        self.targets = np.asarray(targets)
+
+    def __len__(self) -> int:
+        return int(self.polygon_data.num_polygons)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        polygon = torch.from_numpy(self.polygon_data.polygon(index)).to(torch.float32)
+        target = torch.as_tensor(self.targets[index])
+        return polygon, target
+
+
+def _collate_polygon_targets(
+    items: list[tuple[torch.Tensor, torch.Tensor]],
+) -> tuple[PolygonGraphBatch, torch.Tensor]:
+    polygons, targets = zip(*items, strict=True)
+    graph_batch = collate_polygon_graph_batch(list(polygons))
+    target_tensor = torch.stack([target.reshape(()) for target in targets], dim=0)
+    return graph_batch, target_tensor
+
+
+def _load_scores(polygon_data, npz_data: np.lib.npyio.NpzFile) -> np.ndarray:
     if "score" in npz_data:
         return np.asarray(npz_data["score"], dtype=np.float32)
-    return np.asarray([regularity_score(xy).score for xy in coords], dtype=np.float32)
+    return np.asarray([regularity_score(polygon_data.polygon(i)).score for i in range(polygon_data.num_polygons)], dtype=np.float32)
 
 
 def train_guidance_model_from_loaded_config(cfg: dict[str, object], *, config_path: Path) -> GuidanceTrainResult:
@@ -86,13 +109,12 @@ def train_guidance_model_from_loaded_config(cfg: dict[str, object], *, config_pa
     )
 
     polygon_data = load_polygon_dataset(data_path)
-    if not polygon_data.is_uniform:
-        raise ValueError("guidance-model training currently supports fixed-size polygon datasets only")
-    npz_data = np.load(data_path, allow_pickle=True)
-    coords = polygon_data.to_dense()
-    n_vertices = int(polygon_data.num_vertices[0])
-    x = coords.reshape(coords.shape[0], -1)
-    scores = _load_scores(coords, npz_data)
+    with np.load(data_path, allow_pickle=True) as npz_data:
+        scores = _load_scores(polygon_data, npz_data)
+    coords_shape = tuple(polygon_data.coords.shape)
+    n_vertices = int(polygon_data.num_vertices[0]) if polygon_data.is_uniform else None
+    max_vertices = int(polygon_data.max_vertices)
+    model_type = str(model_cfg.get("type", "mlp")).lower()
 
     if guidance_task == "classifier":
         targets_np = (scores >= score_threshold).astype(np.int64)
@@ -105,13 +127,34 @@ def train_guidance_model_from_loaded_config(cfg: dict[str, object], *, config_pa
         num_classes = 1
         criterion = nn.MSELoss()
 
-    dataset = TensorDataset(torch.from_numpy(x), target_tensor)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
+    if model_type == "mlp":
+        if not polygon_data.is_uniform:
+            raise ValueError("guidance-model training with model.type='mlp' supports fixed-size polygon datasets only")
+        coords = polygon_data.to_dense()
+        x = coords.reshape(coords.shape[0], -1)
+        assert x is not None
+        dataset = TensorDataset(torch.from_numpy(x), target_tensor)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
+        model_data_dim = x.shape[1]
+    elif model_type in {"gat", "gcn"}:
+        coords = None
+        x = None
+        dataset = _PolygonTargetDataset(polygon_data, targets_np)
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            collate_fn=_collate_polygon_targets,
+        )
+        model_data_dim = max_vertices * 2
+    else:
+        raise ValueError(f"Unsupported classifier.type {model_type!r}; expected one of: mlp, gat, gcn")
 
     device = device_from_config(cfg)
     model = build_guidance_model(
         task=guidance_task,
-        data_dim=x.shape[1],
+        data_dim=model_data_dim,
         model_cfg=model_cfg,
         num_classes=max(2, num_classes),
     ).to(device)
@@ -119,7 +162,7 @@ def train_guidance_model_from_loaded_config(cfg: dict[str, object], *, config_pa
     forward_diffusion = Diffusion(model=_UnusedDenoiser(), config=diffusion_config, device=device)
 
     print(
-        f"[guidance-train] data={data_path} coords_shape={tuple(coords.shape)} "
+        f"[guidance-train] data={data_path} coords_shape={coords_shape} "
         f"task={guidance_task} save_dir={save_dir}"
     )
     if guidance_task == "classifier":
@@ -142,15 +185,24 @@ def train_guidance_model_from_loaded_config(cfg: dict[str, object], *, config_pa
     start_time = time.perf_counter()
 
     for epoch in range(epochs):
-        for batch_x, batch_target in loader:
+        for batch in loader:
             model.train()
-            batch_x = batch_x.to(device)
-            batch_target = batch_target.to(device)
-
-            t = torch.randint(0, diffusion_config.n_steps, (batch_x.shape[0],), device=device, dtype=torch.long)
-            noise = torch.randn_like(batch_x)
-            x_t = forward_diffusion.q_sample(batch_x, t, noise)
-            pred = model(x_t, t)
+            if model_type == "mlp":
+                batch_x, batch_target = batch
+                batch_x = batch_x.to(device)
+                batch_target = batch_target.to(device)
+                t = torch.randint(0, diffusion_config.n_steps, (batch_x.shape[0],), device=device, dtype=torch.long)
+                noise = torch.randn_like(batch_x)
+                x_t = forward_diffusion.q_sample(batch_x, t, noise)
+                pred = model(x_t, t)
+            else:
+                batch_graph, batch_target = batch
+                batch_graph = batch_graph.to(device)
+                batch_target = batch_target.to(device)
+                t = torch.randint(0, diffusion_config.n_steps, (batch_graph.batch_size,), device=device, dtype=torch.long)
+                noise = torch.randn_like(batch_graph.coords)
+                x_t = forward_diffusion.q_sample(batch_graph.coords, t, noise, graph_batch=batch_graph)
+                pred = model(x_t, t, batch=batch_graph)
 
             if guidance_task == "classifier":
                 loss = criterion(pred, batch_target)
@@ -192,6 +244,7 @@ def train_guidance_model_from_loaded_config(cfg: dict[str, object], *, config_pa
                     "model_cfg": model_cfg,
                     "guidance_task": guidance_task,
                     "n_vertices": n_vertices,
+                    "max_vertices": max_vertices,
                     "diffusion": {
                         "n_steps": diffusion_config.n_steps,
                         "beta_start": diffusion_config.beta_start,
@@ -224,6 +277,7 @@ def train_guidance_model_from_loaded_config(cfg: dict[str, object], *, config_pa
         "model_cfg": model_cfg,
         "guidance_task": guidance_task,
         "n_vertices": n_vertices,
+        "max_vertices": max_vertices,
         "diffusion": {
             "n_steps": diffusion_config.n_steps,
             "beta_start": diffusion_config.beta_start,

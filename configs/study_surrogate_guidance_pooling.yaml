@@ -1,0 +1,76 @@
+study:
+  name: surrogate-guidance-pooling
+  root_dir: data/studies
+
+cases:
+  - name: surrogate-avg-with-t
+    kind: train_surrogate_model
+    config: configs/train_surrogate_guidance_model.yaml
+    overrides:
+      experiment_name: surrogate-avg-with-t
+      model.pooling: avg
+      model.timestep_conditioning: true
+    tags:
+      pooling: avg
+      timestep_conditioning: true
+      noise_regime: noisy
+
+  - name: surrogate-max-with-t
+    kind: train_surrogate_model
+    config: configs/train_surrogate_guidance_model.yaml
+    overrides:
+      experiment_name: surrogate-max-with-t
+      model.pooling: max
+      model.timestep_conditioning: true
+    tags:
+      pooling: max
+      timestep_conditioning: true
+      noise_regime: noisy
+
+  - name: surrogate-sum-with-t
+    kind: train_surrogate_model
+    config: configs/train_surrogate_guidance_model.yaml
+    overrides:
+      experiment_name: surrogate-sum-with-t
+      model.pooling: sum
+      model.timestep_conditioning: true
+    tags:
+      pooling: sum
+      timestep_conditioning: true
+      noise_regime: noisy
+
+  - name: surrogate-avg-no-t
+    kind: train_surrogate_model
+    config: configs/train_surrogate_guidance_model.yaml
+    overrides:
+      experiment_name: surrogate-avg-no-t
+      model.pooling: avg
+      model.timestep_conditioning: false
+    tags:
+      pooling: avg
+      timestep_conditioning: false
+      noise_regime: noisy
+
+  - name: surrogate-max-no-t
+    kind: train_surrogate_model
+    config: configs/train_surrogate_guidance_model.yaml
+    overrides:
+      experiment_name: surrogate-max-no-t
+      model.pooling: max
+      model.timestep_conditioning: false
+    tags:
+      pooling: max
+      timestep_conditioning: false
+      noise_regime: noisy
+
+  - name: surrogate-sum-no-t
+    kind: train_surrogate_model
+    config: configs/train_surrogate_guidance_model.yaml
+    overrides:
+      experiment_name: surrogate-sum-no-t
+      model.pooling: sum
+      model.timestep_conditioning: false
+    tags:
+      pooling: sum
+      timestep_conditioning: false
+      noise_regime: noisy

@@ -4,16 +4,18 @@ seed: 0
 device: auto
 
 data:
-  path: "data/raw/hexagons.npz"
+  path: "data/raw/hexagons.npz" # fixed-size: hexagons.npz | variable-size: mixed_polygons.npz
   batch_size: 128
   shuffle: true
   num_workers: 0
 
 classifier:
-  type: mlp # future extension point: gat | gcn for variable-size polygon guidance
+  type: mlp # mlp | gat | gcn
   hidden_dim: 256
   time_emb_dim: 64
   num_layers: 3
+  pooling: avg # gat | gcn only: avg | max | sum
+  timestep_conditioning: true
 
 diffusion:
   n_steps: 20

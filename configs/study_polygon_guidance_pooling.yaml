@@ -1,0 +1,106 @@
+study:
+  name: polygon-guidance-pooling
+  root_dir: data/studies
+
+cases:
+  - name: polygon-gat-avg-with-t
+    kind: train_guidance_model
+    config: configs/train_guidance_model.yaml
+    overrides:
+      experiment_name: polygon-gat-avg-with-t
+      data.path: data/raw/mixed_polygons.npz
+      classifier.type: gat
+      classifier.pooling: avg
+      classifier.timestep_conditioning: true
+      labels.type: score_regression
+    tags:
+      domain: polygon
+      architecture: gat
+      pooling: avg
+      timestep_conditioning: true
+      variable_size: true
+
+  - name: polygon-gat-max-with-t
+    kind: train_guidance_model
+    config: configs/train_guidance_model.yaml
+    overrides:
+      experiment_name: polygon-gat-max-with-t
+      data.path: data/raw/mixed_polygons.npz
+      classifier.type: gat
+      classifier.pooling: max
+      classifier.timestep_conditioning: true
+      labels.type: score_regression
+    tags:
+      domain: polygon
+      architecture: gat
+      pooling: max
+      timestep_conditioning: true
+      variable_size: true
+
+  - name: polygon-gat-sum-with-t
+    kind: train_guidance_model
+    config: configs/train_guidance_model.yaml
+    overrides:
+      experiment_name: polygon-gat-sum-with-t
+      data.path: data/raw/mixed_polygons.npz
+      classifier.type: gat
+      classifier.pooling: sum
+      classifier.timestep_conditioning: true
+      labels.type: score_regression
+    tags:
+      domain: polygon
+      architecture: gat
+      pooling: sum
+      timestep_conditioning: true
+      variable_size: true
+
+  - name: polygon-gat-avg-no-t
+    kind: train_guidance_model
+    config: configs/train_guidance_model.yaml
+    overrides:
+      experiment_name: polygon-gat-avg-no-t
+      data.path: data/raw/mixed_polygons.npz
+      classifier.type: gat
+      classifier.pooling: avg
+      classifier.timestep_conditioning: false
+      labels.type: score_regression
+    tags:
+      domain: polygon
+      architecture: gat
+      pooling: avg
+      timestep_conditioning: false
+      variable_size: true
+
+  - name: polygon-gat-max-no-t
+    kind: train_guidance_model
+    config: configs/train_guidance_model.yaml
+    overrides:
+      experiment_name: polygon-gat-max-no-t
+      data.path: data/raw/mixed_polygons.npz
+      classifier.type: gat
+      classifier.pooling: max
+      classifier.timestep_conditioning: false
+      labels.type: score_regression
+    tags:
+      domain: polygon
+      architecture: gat
+      pooling: max
+      timestep_conditioning: false
+      variable_size: true
+
+  - name: polygon-gat-sum-no-t
+    kind: train_guidance_model
+    config: configs/train_guidance_model.yaml
+    overrides:
+      experiment_name: polygon-gat-sum-no-t
+      data.path: data/raw/mixed_polygons.npz
+      classifier.type: gat
+      classifier.pooling: sum
+      classifier.timestep_conditioning: false
+      labels.type: score_regression
+    tags:
+      domain: polygon
+      architecture: gat
+      pooling: sum
+      timestep_conditioning: false
+      variable_size: true

@@ -25,6 +25,7 @@ Variable-size polygon data is stored raggedly as concatenated `coords` plus a pe
 - `models/`: local checkpoints, logs, and config snapshots, organized per run under `models/run_*`
 - `pretrained_models/`: externally trained checkpoints
 - `notebooks/`: exploratory analysis
+- `predict_binding_affinity/`: surrogate affinity experiments for ligand-context guidance
 - `tests/`: pytest tests
 
 ## Variable-Size GNN Pipeline
@@ -236,7 +237,22 @@ python scripts/generate_data/generate_thesis_datasets.py
 python -m polydiff.studies.run --config configs/study_guidance_characterization.yaml
 python -m polydiff.studies.run --config configs/study_architecture_noise_sweep.yaml
 python -m polydiff.studies.run --config configs/study_distribution_fidelity.yaml
+python -m polydiff.studies.run --config configs/study_polygon_guidance_pooling.yaml
+python -m polydiff.pocket_conditioning.study --config configs/study_pocket_fit_conditioning.yaml
+python -m predict_binding_affinity.studies.run --config configs/study_surrogate_guidance_pooling.yaml
 ```
+
+`study_pocket_fit_conditioning.yaml` is the polygon pocket analogue for the binding-affinity guidance problem. It:
+
+- generates synthetic `(ligand polygon, pocket polygon)` pairs with an exact pocket-fit reward
+- trains two pocket-conditioned surrogates on noisy ligand states, one with `t` and one without `t`
+- compares `unguided`, `analytic-pocket-fit`, `surrogate-no-t`, and `surrogate-with-t`
+- reports reward gain, manifold drift, and invalidity together so you can decide whether timestep-conditioned learned guidance is worth carrying into the molecular pipeline
+- now also saves matched-seed trajectory GIFs and a final-state comparison panel so unguided and guided generation can be compared visually on the same pocket
+
+The thesis-facing explanation for that study is in [`docs/pocket_fit_conditioning_study.md`](docs/pocket_fit_conditioning_study.md).
+
+`study_polygon_guidance_pooling.yaml` is the variable-size polygon counterpart to the molecular surrogate pooling study. It uses pooled graph guidance models in the main polygon guidance-training path, so you can compare `avg`, `max`, and `sum` pooling with and without timestep conditioning on ragged polygon datasets such as `mixed_polygons.npz`.
 
 Set `study.parallel.enabled: true` when you want the study runner to launch dependency-independent cases in parallel. By default that mode only activates when CUDA is available; use `study.parallel.require_cuda: false` if you intentionally want the same scheduler on CPU.
 
@@ -258,13 +274,58 @@ Each study writes a numbered folder under `data/studies/` containing:
   - architecture metric panels
   - guidance timing sweeps
   - guidance strength sweeps, including extreme-scale stress tests
-  - architecture-by-guidance distribution-fidelity sweeps
-  - architecture-vs-dataset-noise sweeps
-  - outlier failure-mode summaries
+  - surrogate pooling / timestep-conditioning metric panels
+
+## Surrogate Guidance Study
+
+The surrogate-affinity path lives under `predict_binding_affinity/`. It is separate from the polygon diffusion study runner because the output is not a polygon sample archive; it is a learned ligand-context regressor intended to be usable as a guidance model later.
+
+The polygon guidance-model path now also supports graph backbones and pooled readouts. In [`configs/train_guidance_model.yaml`](configs/train_guidance_model.yaml), set:
+
+- `classifier.type: gat` or `classifier.type: gcn`
+- `classifier.pooling: avg | max | sum`
+- `classifier.timestep_conditioning: true | false`
+- `data.path: data/raw/mixed_polygons.npz` for a ragged variable-size dataset
+
+The main ablation now implemented is:
+
+- noisy ligand-coordinate training with timestep conditioning
+- noisy ligand-coordinate training without timestep conditioning
+- pooled GNN readout comparison across `avg`, `max`, and `sum`
+
+This pooling step is the order-invariant graph readout over ligand-node features. It is the part that guarantees the surrogate output does not depend on atom ordering.
+
+Run one surrogate training case with:
+
+```bash
+python -m predict_binding_affinity.train_surrogate_model --config configs/train_surrogate_guidance_model.yaml
+```
+
+Run the full surrogate study with:
+
+```bash
+python -m predict_binding_affinity.studies.run --config configs/study_surrogate_guidance_pooling.yaml
+```
+
+Before running those commands, fill in `data.pt_path` or `data.pt_dir` and `data.pdb_path` in [`configs/train_surrogate_guidance_model.yaml`](configs/train_surrogate_guidance_model.yaml). The loader accepts either:
+
+- explicit `ligand_atomic_numbers` + ligand positions in the `.pt` records
+- or RDKit `mol` objects + ligand positions, in which case `rdkit` must be installed in the environment that loads the records
+
+Each surrogate study also writes `INTERPRET_RESULTS.md` into its `data/studies/study_*` folder so the pooling and timestep-conditioning comparison is documented alongside the figures.
+
+Other study outputs include:
+
+- architecture-by-guidance distribution-fidelity sweeps
+- architecture-vs-dataset-noise sweeps
+- outlier failure-mode summaries
 
 The study manifest supports placeholder references such as `{{train-mlp.run_name}}` so later cases can consume earlier outputs.
-- `data/processed/run_####__.../sample_0001__.../media/animations/sample_0000.gif` and friends when animation export is enabled
-- `data/processed/run_####__.../sample_0001__.../media/notebooks/compare_polygon_distributions/*.png` for saved notebook comparison figures
+
+When animation export or notebook figure export is enabled, sampling may also write:
+
+- `data/processed/run_####__.../sample_0001__.../media/animations/sample_0000.gif` and related GIFs
+- `data/processed/run_####__.../sample_0001__.../media/notebooks/compare_polygon_distributions/*.png`
 
 If you sample from the same model run multiple times, each invocation gets a new `sample_####__...` directory. That keeps unguided, guided, and parameter-sweep sampling outputs from overwriting each other.
 

@@ -404,11 +404,6 @@ def sample_from_loaded_config(
     if request.guidance.enabled:
         descriptions: list[str] = []
         for component in request.guidance.components:
-            if model_type != "mlp" and component.kind in {"classifier", "regressor"} and uniform_sample_size is None:
-                raise ValueError(
-                    "checkpoint-backed classifier/regressor guidance requires a uniform polygon size batch; "
-                    "use sampling.size_distribution with one size or switch to analytic guidance"
-                )
             _, guidance, guidance_n_vertices = load_sampling_guidance(
                 component.checkpoint_path,
                 device=device,
@@ -429,9 +424,20 @@ def sample_from_loaded_config(
                 timestep_power=component.timestep_power,
                 restoration=request.restoration,
             )
+            if model_type != "mlp" and component.kind in {"classifier", "regressor"}:
+                if guidance_n_vertices is not None and uniform_sample_size is None:
+                    raise ValueError(
+                        "MLP checkpoint-backed classifier/regressor guidance requires a uniform polygon size batch; "
+                        "use sampling.size_distribution with one size or switch to graph guidance"
+                    )
+                if guidance_n_vertices is not None and uniform_sample_size is not None and guidance_n_vertices != int(uniform_sample_size):
+                    raise ValueError(
+                        f"guidance model n_vertices={guidance_n_vertices} does not match sampled polygon size {int(uniform_sample_size)}"
+                    )
             if (
                 model_type == "mlp"
                 and component.kind in {"classifier", "regressor"}
+                and guidance_n_vertices is not None
                 and guidance_n_vertices != int(sample_num_vertices[0])
             ):
                 raise ValueError(
