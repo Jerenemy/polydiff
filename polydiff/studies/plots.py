@@ -194,6 +194,169 @@ def save_multi_case_score_distribution_figure(
     return out_path
 
 
+def _guidance_metric_spec(summary_df: pd.DataFrame) -> tuple[str, str, bool] | None:
+    candidates = (
+        ("final_mae", "final MAE", False),
+        ("best_mae", "best MAE", False),
+        ("final_acc", "final accuracy", True),
+        ("best_acc", "best accuracy", True),
+        ("final_ema_loss", "final EMA loss", False),
+        ("final_loss", "final loss", False),
+    )
+    for key, label, higher_is_better in candidates:
+        if key in summary_df.columns and summary_df[key].notna().any():
+            return key, label, higher_is_better
+    return None
+
+
+def _guidance_secondary_metric_spec(summary_df: pd.DataFrame, *, primary_key: str) -> tuple[str, str, bool] | None:
+    candidates = (
+        ("final_ema_loss", "final EMA loss", False),
+        ("final_loss", "final loss", False),
+        ("best_mae", "best MAE", False),
+        ("best_acc", "best accuracy", True),
+    )
+    for key, label, higher_is_better in candidates:
+        if key == primary_key:
+            continue
+        if key in summary_df.columns and summary_df[key].notna().any():
+            return key, label, higher_is_better
+    return None
+
+
+def _guidance_case_color_map(
+    summary_df: pd.DataFrame,
+    case_histories: list[tuple[str, pd.DataFrame]],
+) -> dict[str, tuple[float, float, float, float]]:
+    ordered_case_names: list[str] = []
+    if "case_name" in summary_df.columns:
+        for case_name in summary_df["case_name"].astype(str).tolist():
+            if case_name not in ordered_case_names:
+                ordered_case_names.append(case_name)
+    for case_name, _ in case_histories:
+        label = str(case_name)
+        if label not in ordered_case_names:
+            ordered_case_names.append(label)
+
+    cmap = plt.get_cmap("tab10")
+    return {
+        case_name: cmap(index % 10)
+        for index, case_name in enumerate(ordered_case_names)
+    }
+
+
+def _plot_guidance_summary_bars(
+    ax,
+    summary_df: pd.DataFrame,
+    *,
+    metric_key: str,
+    metric_label: str,
+    higher_is_better: bool,
+    case_colors: dict[str, tuple[float, float, float, float]],
+) -> None:
+    plot_df = summary_df.loc[:, ["case_name", metric_key]].dropna().copy()
+    if plot_df.empty:
+        ax.axis("off")
+        return
+    plot_df = plot_df.sort_values(metric_key, ascending=not higher_is_better, kind="stable")
+    values = plot_df[metric_key].to_numpy(dtype=np.float64, copy=False)
+    labels = plot_df["case_name"].astype(str).tolist()
+    colors = [case_colors[label] for label in labels]
+    y_positions = np.arange(len(plot_df), dtype=np.float64)
+    ax.barh(y_positions, values, color=colors, alpha=0.85)
+    ax.set_yticks(y_positions, labels)
+    ax.invert_yaxis()
+    ax.set_xlabel(metric_label)
+    ax.set_title(f"{metric_label} ({'higher' if higher_is_better else 'lower'} is better)")
+    ax.grid(axis="x", alpha=0.2)
+
+
+def save_guidance_training_comparison_figure(
+    summary_df: pd.DataFrame,
+    case_histories: list[tuple[str, pd.DataFrame]],
+    out_path: str | Path,
+    *,
+    title: str = "Guidance Training Comparison",
+) -> Path | None:
+    primary_spec = _guidance_metric_spec(summary_df)
+    has_histories = any(not history.empty for _, history in case_histories)
+    if primary_spec is None and not has_histories:
+        return None
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(2, 2, figsize=(12.0, 8.0))
+    axes_array = np.atleast_1d(axes).reshape(-1)
+    case_colors = _guidance_case_color_map(summary_df, case_histories)
+
+    if has_histories:
+        for case_name, history in case_histories:
+            if history.empty or "step" not in history.columns:
+                continue
+            color = case_colors[str(case_name)]
+            if "loss" in history.columns and history["loss"].notna().any():
+                axes_array[0].plot(
+                    history["step"].to_numpy(dtype=np.float64, copy=False),
+                    history["loss"].to_numpy(dtype=np.float64, copy=False),
+                    label=case_name,
+                    color=color,
+                    linewidth=1.5,
+                )
+            if "ema_loss" in history.columns and history["ema_loss"].notna().any():
+                axes_array[1].plot(
+                    history["step"].to_numpy(dtype=np.float64, copy=False),
+                    history["ema_loss"].to_numpy(dtype=np.float64, copy=False),
+                    label=case_name,
+                    color=color,
+                    linewidth=1.5,
+                )
+        axes_array[0].set_xlabel("step")
+        axes_array[0].set_ylabel("loss")
+        axes_array[0].set_title("Training Loss")
+        axes_array[0].grid(alpha=0.2)
+        axes_array[1].set_xlabel("step")
+        axes_array[1].set_ylabel("EMA loss")
+        axes_array[1].set_title("Training EMA Loss")
+        axes_array[1].grid(alpha=0.2)
+        axes_array[1].legend(frameon=False, fontsize=8)
+    else:
+        axes_array[0].axis("off")
+        axes_array[1].axis("off")
+
+    if primary_spec is None:
+        axes_array[2].axis("off")
+        axes_array[3].axis("off")
+    else:
+        primary_key, primary_label, primary_higher_is_better = primary_spec
+        _plot_guidance_summary_bars(
+            axes_array[2],
+            summary_df,
+            metric_key=primary_key,
+            metric_label=primary_label,
+            higher_is_better=primary_higher_is_better,
+            case_colors=case_colors,
+        )
+        secondary_spec = _guidance_secondary_metric_spec(summary_df, primary_key=primary_key)
+        if secondary_spec is None:
+            axes_array[3].axis("off")
+        else:
+            secondary_key, secondary_label, secondary_higher_is_better = secondary_spec
+            _plot_guidance_summary_bars(
+                axes_array[3],
+                summary_df,
+                metric_key=secondary_key,
+                metric_label=secondary_label,
+                higher_is_better=secondary_higher_is_better,
+                case_colors=case_colors,
+            )
+
+    fig.suptitle(title, fontsize=14)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+    return out_path
+
+
 def _metric_label(metric_key: str) -> str:
     labels = {
         "generated_summary.score_mean": "score mean",

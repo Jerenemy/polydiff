@@ -18,19 +18,21 @@ device: auto
 
 data:
   ligand_data_path: data/raw/hexagons.npz
-  generated_data_dir: data/pocket_conditioning/pocket-fit-conditioning
+  # Use a fresh cache so the study does not silently reuse the earlier large, smooth pockets.
+  generated_data_dir: data/pocket_conditioning/pocket-fit-conditioning-small-irregular
   force_regenerate: false
   ligand_size: 6
-  pocket_size: 10
+  # Keep pockets convex for the reward, but make them smaller and visibly less regular.
+  pocket_size: 1
   num_train_pairs: 24000
   num_val_pairs: 4000
   num_test_pairs: 4000
   num_eval_pockets: 8
-  pocket_radial_sigma: 0.10
-  pocket_angle_sigma: 0.04
-  pocket_smooth_passes: 7
-  pocket_scale_min: 1.9
-  pocket_scale_max: 2.5
+  pocket_radial_sigma: 0.20
+  pocket_angle_sigma: 0.08
+  pocket_smooth_passes: 2
+  pocket_scale_min: 1.6
+  pocket_scale_max: 2.05
   ligand_scale_min: 0.55
   ligand_scale_max: 1.55
 
@@ -90,7 +92,7 @@ guidance:
   # Keep schedule/scale fixed when comparing surrogate-with-t vs surrogate-no-t.
   # If you later sweep these, do it after establishing the surrogate training comparison.
   num_samples_per_pocket: 512
-  n_steps: 250
+  n_steps: 50
   schedule: late
   scale: 8.0
   seed: 0

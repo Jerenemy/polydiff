@@ -1,0 +1,32 @@
+{
+  "data": {},
+  "device": "auto",
+  "model": {
+    "cutoff": 4.0,
+    "dropout": 0.1,
+    "hidden_dim": 128,
+    "num_layers": 4,
+    "num_rbf": 16,
+    "time_emb_dim": 64,
+    "timestep_conditioning": false
+  },
+  "noise": {
+    "beta_end": 0.02,
+    "beta_start": 0.0001,
+    "enabled": true,
+    "n_steps": 1000
+  },
+  "seed": 0,
+  "study_name": "pocket-fit-conditioning",
+  "timestep_conditioning": false,
+  "training": {
+    "batch_size": 64,
+    "epochs": 24,
+    "eval_repeats": 4,
+    "log_every": 1,
+    "lr": 0.0003,
+    "processed_dir": "data/pocket_conditioning",
+    "save_dir": "models/pocket_conditioning",
+    "weight_decay": 1e-05
+  }
+}

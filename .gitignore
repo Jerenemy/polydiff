@@ -47,5 +47,9 @@ testpkg/
 
 plots/
 
+<<<<<<< HEAD
 models/**/*.yaml
 models/**/*.json
+=======
+predict_binding_affinity/
+>>>>>>> changes from pc

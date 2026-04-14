@@ -42,6 +42,7 @@ from ..training.train import train_from_loaded_config
 from ..training.train_guidance_model import train_guidance_model_from_loaded_config
 from ..utils.runtime import load_yaml_config, resolve_project_path
 from .plots import (
+    save_guidance_training_comparison_figure,
     save_failure_mode_rate_figure,
     save_metric_sweep_figure,
     save_multi_case_score_distribution_figure,
@@ -449,6 +450,22 @@ def _write_case_results(path: Path, case_results: dict[str, dict[str, Any]]) -> 
     return _write_json(path, case_results)
 
 
+def _load_jsonl_records(path: str | Path | None) -> list[dict[str, Any]]:
+    if path is None:
+        return []
+    resolved = Path(path)
+    if not resolved.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    with open(resolved, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            records.append(json.loads(line))
+    return records
+
+
 def _write_case_report(
     *,
     paths_obj: StudyPaths,
@@ -650,6 +667,53 @@ def _build_sample_case_summary_entry(
         comparison_artifacts=comparison_artifacts,
     )
     return row, figure_paths
+
+
+def _build_guidance_case_summary_entry(
+    *,
+    case: StudyCase,
+    case_name: str,
+    case_result: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, str], pd.DataFrame | None]:
+    metrics_path = case_result.get("metrics_path")
+    history_records = _load_jsonl_records(metrics_path)
+    history_rows = [record for record in history_records if str(record.get("event")) == "train_step"]
+    history_df = pd.DataFrame(history_rows)
+    if not history_df.empty and "step" in history_df.columns:
+        sort_columns = [column for column in ("step", "epoch") if column in history_df.columns]
+        history_df = history_df.sort_values(sort_columns, kind="stable", na_position="last").reset_index(drop=True)
+
+    row = {
+        "case_name": case_name,
+        "case_kind": case_result.get("case_kind"),
+        "resolved_config_path": case_result.get("resolved_config_path"),
+        "checkpoint_path": case_result.get("checkpoint_path"),
+        "metrics_path": metrics_path,
+        "log_path": case_result.get("log_path"),
+        "run_name": case_result.get("run_name"),
+        "guidance_task": case_result.get("guidance_task"),
+    }
+    row.update(flatten_mapping(case.tags, prefix="case_tags"))
+
+    if not history_df.empty:
+        final_row = history_df.iloc[-1]
+        row["num_logged_steps"] = int(history_df.shape[0])
+        if "step" in history_df.columns:
+            row["final_step"] = int(final_row["step"])
+        if "loss" in history_df.columns and history_df["loss"].notna().any():
+            row["final_loss"] = float(final_row["loss"])
+            row["best_loss"] = float(history_df["loss"].min())
+        if "ema_loss" in history_df.columns and history_df["ema_loss"].notna().any():
+            row["final_ema_loss"] = float(final_row["ema_loss"])
+            row["best_ema_loss"] = float(history_df["ema_loss"].min())
+        if "mae" in history_df.columns and history_df["mae"].notna().any():
+            row["final_mae"] = float(history_df["mae"].dropna().iloc[-1])
+            row["best_mae"] = float(history_df["mae"].min())
+        if "acc" in history_df.columns and history_df["acc"].notna().any():
+            row["final_acc"] = float(history_df["acc"].dropna().iloc[-1])
+            row["best_acc"] = float(history_df["acc"].max())
+
+    return row, {}, None if history_df.empty else history_df
 
 
 def _write_tradeoff_plot(summary_df: pd.DataFrame, *, out_path: Path) -> Path | None:
@@ -999,6 +1063,75 @@ def _write_sample_summary_outputs(
     }
 
 
+def _write_guidance_summary_outputs(
+    *,
+    paths_obj: StudyPaths,
+    rows: list[dict[str, Any]],
+    case_histories: dict[str, pd.DataFrame],
+    figure_paths_by_case: dict[str, dict[str, str]],
+) -> dict[str, Any]:
+    if not rows:
+        return {
+            "guidance_summary_csv_path": None,
+            "guidance_summary_json_path": None,
+            "guidance_comparison_plot_path": None,
+            "study_figure_paths": {},
+            "figure_paths_by_case": figure_paths_by_case,
+        }
+
+    summary_df = pd.DataFrame(rows)
+    summary_csv_path = paths_obj.reports_dir / "guidance_case_summary.csv"
+    summary_json_path = paths_obj.reports_dir / "guidance_case_summary.json"
+    summary_df.to_csv(summary_csv_path, index=False)
+    _write_json(summary_json_path, rows)
+
+    comparison_path = save_guidance_training_comparison_figure(
+        summary_df,
+        [
+            (case_name, case_histories[case_name])
+            for case_name in summary_df["case_name"].astype(str).tolist()
+            if case_name in case_histories
+        ],
+        paths_obj.figures_dir / "guidance_training_comparison.png",
+    )
+    study_figure_paths = {}
+    if comparison_path is not None:
+        study_figure_paths["guidance_training_comparison"] = str(comparison_path)
+
+    return {
+        "guidance_summary_csv_path": str(summary_csv_path),
+        "guidance_summary_json_path": str(summary_json_path),
+        "guidance_comparison_plot_path": None if comparison_path is None else str(comparison_path),
+        "study_figure_paths": study_figure_paths,
+        "figure_paths_by_case": figure_paths_by_case,
+    }
+
+
+def _empty_summary_payload() -> dict[str, Any]:
+    return {
+        "summary_csv_path": None,
+        "summary_json_path": None,
+        "tradeoff_plot_path": None,
+        "study_figure_paths": {},
+        "interpretation_guide_path": None,
+        "figure_paths_by_case": {},
+        "guidance_summary_csv_path": None,
+        "guidance_summary_json_path": None,
+        "guidance_comparison_plot_path": None,
+    }
+
+
+def _merge_summary_payloads(*payloads: dict[str, Any]) -> dict[str, Any]:
+    merged = _empty_summary_payload()
+    for payload in payloads:
+        for key, value in payload.items():
+            if key in {"study_figure_paths", "figure_paths_by_case"}:
+                merged[key] = {**merged.get(key, {}), **(value or {})}
+            elif value is not None:
+                merged[key] = value
+    return merged
+
+
 def _summarize_sample_cases(
     *,
     spec: StudySpec,
@@ -1038,6 +1171,45 @@ def _summarize_sample_cases(
     return summary_payload, rows, figure_paths_by_case
 
 
+def _summarize_guidance_cases(
+    *,
+    spec: StudySpec,
+    paths_obj: StudyPaths,
+    case_results: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, dict[str, str]]]:
+    rows: list[dict[str, Any]] = []
+    figure_paths_by_case: dict[str, dict[str, str]] = {}
+    case_histories: dict[str, pd.DataFrame] = {}
+    for case in spec.cases:
+        case_result = case_results.get(case.name)
+        if case_result is None or case_result.get("case_kind") != "train_guidance_model":
+            continue
+        row, figure_paths, history_df = _build_guidance_case_summary_entry(
+            case=case,
+            case_name=case.name,
+            case_result=case_result,
+        )
+        rows.append(row)
+        figure_paths_by_case[case.name] = figure_paths
+        if history_df is not None:
+            case_histories[case.name] = history_df
+        _write_case_report(
+            paths_obj=paths_obj,
+            case=case,
+            case_name=case.name,
+            case_result=case_result,
+            figure_paths=figure_paths,
+            summary_row=row,
+        )
+    summary_payload = _write_guidance_summary_outputs(
+        paths_obj=paths_obj,
+        rows=rows,
+        case_histories=case_histories,
+        figure_paths_by_case=figure_paths_by_case,
+    )
+    return summary_payload, rows, figure_paths_by_case
+
+
 def _ingest_case_result(
     *,
     spec: StudySpec,
@@ -1048,7 +1220,9 @@ def _ingest_case_result(
     case_results_path: Path,
     case_report_paths_by_case: dict[str, str],
     sample_rows: list[dict[str, Any]],
+    guidance_rows: list[dict[str, Any]],
     figure_paths_by_case: dict[str, dict[str, str]],
+    guidance_histories: dict[str, pd.DataFrame],
     summary_payload: dict[str, Any],
 ) -> dict[str, Any]:
     case_results[case.name] = case_result
@@ -1076,11 +1250,42 @@ def _ingest_case_result(
             summary_row=row,
         )
         case_report_paths_by_case[case.name] = str(case_report_path)
-        return _write_sample_summary_outputs(
-            spec=spec,
+        return _merge_summary_payloads(
+            summary_payload,
+            _write_sample_summary_outputs(
+                spec=spec,
+                paths_obj=paths_obj,
+                rows=sample_rows,
+                figure_paths_by_case=figure_paths_by_case,
+            ),
+        )
+    if case_result.get("case_kind") == "train_guidance_model":
+        row, figure_paths, history_df = _build_guidance_case_summary_entry(
+            case=case,
+            case_name=case.name,
+            case_result=case_result,
+        )
+        guidance_rows.append(row)
+        figure_paths_by_case[case.name] = figure_paths
+        if history_df is not None:
+            guidance_histories[case.name] = history_df
+        case_report_path = _write_case_report(
             paths_obj=paths_obj,
-            rows=sample_rows,
-            figure_paths_by_case=figure_paths_by_case,
+            case=case,
+            case_name=case.name,
+            case_result=case_result,
+            figure_paths=figure_paths,
+            summary_row=row,
+        )
+        case_report_paths_by_case[case.name] = str(case_report_path)
+        return _merge_summary_payloads(
+            summary_payload,
+            _write_guidance_summary_outputs(
+                paths_obj=paths_obj,
+                rows=guidance_rows,
+                case_histories=guidance_histories,
+                figure_paths_by_case=figure_paths_by_case,
+            ),
         )
     return summary_payload
 
@@ -1140,13 +1345,10 @@ def run_study_from_config(config_path: Path) -> Path:
     case_results_path = paths_obj.reports_dir / "case_results.json"
     case_report_paths_by_case: dict[str, str] = {}
     sample_rows: list[dict[str, Any]] = []
+    guidance_rows: list[dict[str, Any]] = []
+    guidance_histories: dict[str, pd.DataFrame] = {}
     figure_paths_by_case: dict[str, dict[str, str]] = {}
-    summary_payload = _write_sample_summary_outputs(
-        spec=spec,
-        paths_obj=paths_obj,
-        rows=sample_rows,
-        figure_paths_by_case=figure_paths_by_case,
-    )
+    summary_payload = _empty_summary_payload()
     final_report_path = _write_study_report(
         paths_obj=paths_obj,
         spec=spec,
@@ -1215,7 +1417,9 @@ def run_study_from_config(config_path: Path) -> Path:
                     case_results_path=case_results_path,
                     case_report_paths_by_case=case_report_paths_by_case,
                     sample_rows=sample_rows,
+                    guidance_rows=guidance_rows,
                     figure_paths_by_case=figure_paths_by_case,
+                    guidance_histories=guidance_histories,
                     summary_payload=summary_payload,
                 )
                 final_report_path = _write_study_report(
@@ -1303,7 +1507,9 @@ def run_study_from_config(config_path: Path) -> Path:
                     case_results_path=case_results_path,
                     case_report_paths_by_case=case_report_paths_by_case,
                     sample_rows=sample_rows,
+                    guidance_rows=guidance_rows,
                     figure_paths_by_case=figure_paths_by_case,
+                    guidance_histories=guidance_histories,
                     summary_payload=summary_payload,
                 )
                 final_report_path = _write_study_report(
@@ -1391,13 +1597,22 @@ def refresh_study_outputs(study_dir: Path) -> Path:
         paths_obj=paths_obj,
         case_results=case_results,
     )
+    guidance_payload, guidance_rows, guidance_figure_paths = _summarize_guidance_cases(
+        spec=spec,
+        paths_obj=paths_obj,
+        case_results=case_results,
+    )
+    figure_paths_by_case.update(guidance_figure_paths)
+    summary_payload = _merge_summary_payloads(summary_payload, guidance_payload)
+    rows_by_case = {row["case_name"]: row for row in rows}
+    rows_by_case.update({row["case_name"]: row for row in guidance_rows})
 
     case_report_paths_by_case: dict[str, str] = {}
     for case in spec.cases:
         case_result = case_results.get(case.name)
         if case_result is None:
             continue
-        summary_row = next((row for row in rows if row["case_name"] == case.name), None)
+        summary_row = rows_by_case.get(case.name)
         case_report_path = _write_case_report(
             paths_obj=paths_obj,
             case=case,

@@ -31,5 +31,5 @@ training:
   lr: 0.0002
   log_every: 50
   save_every: 500
-  save_dir: "models"
-  checkpoint_name: "regressor_final.pt" # use regressor_final.pt for score_regression
+  save_dir: "models" # root directory; each invocation creates models/run_####__.../
+  checkpoint_name: "regressor_final.pt" # written inside that run directory for score_regression

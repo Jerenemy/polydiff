@@ -1,0 +1,1 @@
+i want to compare the exact architecture i used in guidance_wrapper_ligand_context.ipynb but for the polygon domain, and i want to see if that architecture works for training a surrogate model and then using guidance to bias the diffusion process. i want to test those things separately

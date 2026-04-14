@@ -117,7 +117,13 @@ def run_pocket_fit_study_from_config(config_path: Path) -> dict[str, Any]:
     if not isinstance(guidance_cfg, dict):
         raise ValueError("guidance config must be a mapping")
     num_samples_per_pocket = int(guidance_cfg.get("num_samples_per_pocket", 256))
-    n_steps = int(guidance_cfg.get("n_steps", 250))
+    requested_n_steps = guidance_cfg.get("n_steps")
+    n_steps = int(diffusion.config.n_steps if requested_n_steps is None else requested_n_steps)
+    if not 1 <= n_steps <= int(diffusion.config.n_steps):
+        raise ValueError(
+            f"guidance.n_steps must be in [1, {diffusion.config.n_steps}] for the loaded diffusion prior, got {n_steps}. "
+            "Update guidance.n_steps or diffusion.overrides.diffusion.n_steps so they agree."
+        )
     schedule_name = str(guidance_cfg.get("schedule", "late"))
     common_scale = float(guidance_cfg.get("scale", 6.0))
     analytic_scale = float(guidance_cfg.get("analytic_scale", common_scale))

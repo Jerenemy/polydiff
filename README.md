@@ -627,7 +627,7 @@ sampling:
   guidance:
     enabled: true
     kind: classifier   # classifier | regressor
-    checkpoint: "models/classifier_final.pt"
+    checkpoint: "models/run_0007__your-guidance-run/classifier_final.pt"
     scale: 1.5
     target_class: 1    # classifier only
     # target_value: 0.95  # regressor only

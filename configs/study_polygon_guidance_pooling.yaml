@@ -13,6 +13,7 @@ cases:
       classifier.pooling: avg
       classifier.timestep_conditioning: true
       labels.type: score_regression
+      training.epochs: 5
     tags:
       domain: polygon
       architecture: gat
@@ -30,6 +31,7 @@ cases:
       classifier.pooling: max
       classifier.timestep_conditioning: true
       labels.type: score_regression
+      training.epochs: 5
     tags:
       domain: polygon
       architecture: gat
@@ -47,6 +49,7 @@ cases:
       classifier.pooling: sum
       classifier.timestep_conditioning: true
       labels.type: score_regression
+      training.epochs: 5
     tags:
       domain: polygon
       architecture: gat
@@ -64,6 +67,7 @@ cases:
       classifier.pooling: avg
       classifier.timestep_conditioning: false
       labels.type: score_regression
+      training.epochs: 5
     tags:
       domain: polygon
       architecture: gat
@@ -81,6 +85,7 @@ cases:
       classifier.pooling: max
       classifier.timestep_conditioning: false
       labels.type: score_regression
+      training.epochs: 5
     tags:
       domain: polygon
       architecture: gat
@@ -98,6 +103,7 @@ cases:
       classifier.pooling: sum
       classifier.timestep_conditioning: false
       labels.type: score_regression
+      training.epochs: 5
     tags:
       domain: polygon
       architecture: gat

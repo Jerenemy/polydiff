@@ -16,9 +16,9 @@ from polydiff.data.diagnostics import (
     summarize_polygon_dataset,
 )
 from polydiff.data.polygon_dataset import load_polygon_dataset
-from polydiff.data.gen_polygons import batch
+from polydiff.data.gen_polygons import batch, batch_variable_sizes
 from polydiff.models.diffusion import build_denoiser
-from polydiff.studies.plots import save_metric_sweep_figure
+from polydiff.studies.plots import _guidance_case_color_map, _plot_guidance_summary_bars, save_metric_sweep_figure
 from polydiff.studies.run import _add_tradeoff_labels, refresh_study_outputs, run_study_from_config
 from polydiff.studies.runtime import apply_dotted_overrides, load_study_spec, resolve_case_placeholders
 
@@ -211,6 +211,49 @@ def test_metric_sweep_figure_supports_symlog_strength_axis(tmp_path):
     assert out_path.exists()
 
 
+def test_guidance_summary_bars_keep_case_colors_consistent():
+    summary_df = pd.DataFrame(
+        [
+            {"case_name": "polygon-gat-avg-with-t", "final_mae": 0.11, "final_ema_loss": 0.0201},
+            {"case_name": "polygon-gat-max-with-t", "final_mae": 0.14, "final_ema_loss": 0.0212},
+            {"case_name": "polygon-gat-sum-with-t", "final_mae": 0.12, "final_ema_loss": 0.0198},
+        ]
+    )
+
+    case_colors = _guidance_case_color_map(summary_df, [])
+    fig, axes = plt.subplots(1, 2, figsize=(10.0, 4.0))
+    _plot_guidance_summary_bars(
+        axes[0],
+        summary_df,
+        metric_key="final_mae",
+        metric_label="final MAE",
+        higher_is_better=False,
+        case_colors=case_colors,
+    )
+    _plot_guidance_summary_bars(
+        axes[1],
+        summary_df,
+        metric_key="final_ema_loss",
+        metric_label="final EMA loss",
+        higher_is_better=False,
+        case_colors=case_colors,
+    )
+
+    def label_to_color(ax):
+        labels = [tick.get_text() for tick in ax.get_yticklabels()]
+        return {
+            label: patch.get_facecolor()
+            for label, patch in zip(labels, ax.patches, strict=True)
+        }
+
+    colors_a = label_to_color(axes[0])
+    colors_b = label_to_color(axes[1])
+    assert colors_a.keys() == colors_b.keys()
+    for label in colors_a:
+        assert colors_a[label] == colors_b[label]
+    plt.close(fig)
+
+
 def test_outlier_failure_mode_summary_counts_self_intersections():
     reference_coords, _, _ = batch(n=6, num=24, seed=0, radial_sigma=0.10, angle_sigma=0.05, smooth_passes=4)
     reference_table = polygon_metric_table(reference_coords)
@@ -359,6 +402,120 @@ def test_run_study_from_config_executes_sample_case_and_writes_reports(tmp_path)
     assert "distribution_distances.shape_distribution_shift_mean_normalized_w1" in refreshed_summary_df.columns
     assert "generated_summary.score_p99" in refreshed_summary_df.columns
     assert "score_threshold_rates.score_ge_0p7_rate" in refreshed_summary_df.columns
+
+
+def test_run_study_from_config_writes_guidance_training_summary_plot(tmp_path):
+    data_path = tmp_path / "mixed_polygons.npz"
+    coords, num_vertices, score, _ = batch_variable_sizes(
+        size_values=[5, 6, 7],
+        size_probabilities=[0.3, 0.4, 0.3],
+        num=18,
+        seed=3,
+        radial_sigma=0.18,
+        angle_sigma=0.12,
+        smooth_passes=3,
+    )
+    np.savez_compressed(
+        data_path,
+        coords=coords.astype(np.float32),
+        num_vertices=num_vertices.astype(np.int32),
+        score=score.astype(np.float32),
+    )
+
+    train_config_path = tmp_path / "train_guidance.yaml"
+    with open(train_config_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(
+            {
+                "seed": 0,
+                "device": "cpu",
+                "experiment_name": "guidance-study-base",
+                "data": {
+                    "path": str(data_path),
+                    "batch_size": 6,
+                    "shuffle": True,
+                    "num_workers": 0,
+                },
+                "classifier": {
+                    "type": "gat",
+                    "hidden_dim": 16,
+                    "time_emb_dim": 8,
+                    "num_layers": 2,
+                    "pooling": "avg",
+                    "timestep_conditioning": True,
+                },
+                "diffusion": {
+                    "n_steps": 16,
+                    "beta_start": 1e-4,
+                    "beta_end": 1e-2,
+                },
+                "labels": {
+                    "type": "score_regression",
+                },
+                "training": {
+                    "epochs": 1,
+                    "lr": 1e-3,
+                    "log_every": 1,
+                    "save_every": 0,
+                    "save_dir": str(tmp_path / "models"),
+                    "checkpoint_name": "regressor_final.pt",
+                },
+            },
+            f,
+            sort_keys=False,
+        )
+
+    study_config_path = tmp_path / "guidance_study.yaml"
+    with open(study_config_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(
+            {
+                "study": {
+                    "name": "guidance-training-study",
+                    "root_dir": str(tmp_path / "studies"),
+                },
+                "cases": [
+                    {
+                        "name": "avg-with-t",
+                        "kind": "train_guidance_model",
+                        "config": str(train_config_path),
+                        "overrides": {
+                            "experiment_name": "avg-with-t",
+                            "classifier.pooling": "avg",
+                            "classifier.timestep_conditioning": True,
+                        },
+                        "tags": {
+                            "pooling": "avg",
+                            "timestep_conditioning": True,
+                        },
+                    },
+                    {
+                        "name": "max-no-t",
+                        "kind": "train_guidance_model",
+                        "config": str(train_config_path),
+                        "overrides": {
+                            "experiment_name": "max-no-t",
+                            "classifier.pooling": "max",
+                            "classifier.timestep_conditioning": False,
+                        },
+                        "tags": {
+                            "pooling": "max",
+                            "timestep_conditioning": False,
+                        },
+                    },
+                ],
+            },
+            f,
+            sort_keys=False,
+        )
+
+    report_path = run_study_from_config(study_config_path)
+    with open(report_path, "r", encoding="utf-8") as f:
+        report_payload = json.load(f)
+
+    assert report_payload["status"] == "completed"
+    assert Path(report_payload["guidance_summary_csv_path"]).exists()
+    assert Path(report_payload["guidance_summary_json_path"]).exists()
+    assert Path(report_payload["guidance_comparison_plot_path"]).exists()
+    assert "guidance_training_comparison" in report_payload["study_figure_paths"]
 
 
 def test_run_study_writes_distribution_guidance_sweep(tmp_path):

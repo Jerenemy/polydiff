@@ -33,7 +33,7 @@ sampling:
   # guidance:
   #   enabled: true
   #   kind: regularity   # classifier | regressor | regularity | area | restoration
-  # #   checkpoint: "models/classifier_final.pt"  # required for classifier/regressor only
+  # #   checkpoint: "models/run_0007__your-guidance-run/classifier_final.pt"  # required for classifier/regressor only
   #   scale: 10.0
   #   target_class: 1    # classifier only
   #   target_value: 0.95 # regressor, regularity, area, or restoration only
