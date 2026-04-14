@@ -20,6 +20,7 @@ Important compatibility rules:
 
 - `model.type: mlp` expects a fixed-size dataset
 - `model.type: gat` and `model.type: gcn` support fixed-size or variable-size polygon datasets
+- `diffusion.prediction_target` controls the denoiser target: `x0` or `epsilon`; `x0` is the training default, and `mean` is accepted as an alias for direct `x0` prediction
 - `train_guidance_model.yaml` now supports `mlp`, `gat`, and `gcn`; graph guidance models can train on fixed-size or variable-size polygon datasets and expose `pooling: avg | max | sum`
 - `train_surrogate_guidance_model.yaml` is separate from the polygon guidance path; it trains a ligand-context surrogate over pooled graph features instead of fixed-size polygons
 

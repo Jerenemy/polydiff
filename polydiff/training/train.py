@@ -101,6 +101,7 @@ def train_from_loaded_config(cfg: dict[str, object], *, config_path: Path) -> Tr
         n_steps=int(diff_cfg.get("n_steps", 1000)),
         beta_start=float(diff_cfg.get("beta_start", 1e-4)),
         beta_end=float(diff_cfg.get("beta_end", 2e-2)),
+        prediction_target=str(diff_cfg.get("prediction_target", "x0")),
     )
 
     device = device_from_config(cfg)
@@ -133,6 +134,7 @@ def train_from_loaded_config(cfg: dict[str, object], *, config_path: Path) -> Tr
             "n_steps": diffusion_config.n_steps,
             "beta_start": diffusion_config.beta_start,
             "beta_end": diffusion_config.beta_end,
+            "prediction_target": diffusion_config.prediction_target,
         },
         "training": {
             **train_cfg,
@@ -160,6 +162,7 @@ def train_from_loaded_config(cfg: dict[str, object], *, config_path: Path) -> Tr
                 "n_steps": diffusion_config.n_steps,
                 "beta_start": diffusion_config.beta_start,
                 "beta_end": diffusion_config.beta_end,
+                "prediction_target": diffusion_config.prediction_target,
             },
             "training_cfg": train_cfg,
         },

@@ -1,6 +1,6 @@
 # From Noise to Geometry: Training a Diffusion Model to Draw Polygons
 
-> Update: this post describes the original fixed-size hexagon baseline. The current codebase also supports variable-size polygon generation for `gat` and `gcn` using ragged graph batches without padded storage.
+> Update: this post describes the original fixed-size hexagon baseline. The current codebase also supports variable-size polygon generation for `gat` and `gcn` using ragged graph batches without padded storage, and the diffusion wrapper now supports either direct `x_0` prediction or epsilon prediction, with `x_0` as the default training target.
 
 What if you could start with pure Gaussian noise and end up with clean, plausible geometry? That is exactly what I’m building in this project: a diffusion model that learns a distribution over 2D polygons and then generates new polygon shapes from scratch.
 
@@ -13,7 +13,7 @@ Project repository: [github.com/Jerenemy/polydiff](https://github.com/Jerenemy/p
 I’m training a DDPM-style model (`polydiff`) on synthetic near-regular polygons (currently hexagons). The workflow is:
 
 1. Generate a dataset of polygons with controlled deformation.
-2. Train a diffusion denoiser to predict noise at random timesteps.
+2. Train a diffusion denoiser to predict a diffusion target at random timesteps.
 3. Sample new polygons by iteratively denoising from random noise.
 4. Evaluate shape quality using the same regularity metric used in data generation.
 
@@ -51,13 +51,14 @@ Current training dataset (`data/raw/hexagons.npz`) has:
 The denoiser in `polydiff/models/diffusion.py` is a timestep-conditioned MLP:
 
 - input: flattened polygon coordinates (`2 * n_vertices`) + sinusoidal timestep embedding
-- output: predicted Gaussian noise (`epsilon`)
+- output: predicted diffusion target (`x_0` by default, `epsilon` optionally)
 
 Diffusion config used in training:
 
 - `n_steps = 1000`
 - linear beta schedule from `1e-4` to `2e-2`
-- objective: MSE between true noise and predicted noise (standard DDPM epsilon prediction)
+- objective: by default, MSE between predicted and true clean coordinates (`x_0` prediction)
+- alternate mode: MSE between true noise and predicted noise (`epsilon` prediction)
 
 ### Training config
 

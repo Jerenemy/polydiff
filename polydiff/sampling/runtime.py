@@ -141,6 +141,7 @@ def load_diffusion_from_checkpoint(
         n_steps=int(checkpoint_diffusion_cfg.get("n_steps", 1000)),
         beta_start=float(checkpoint_diffusion_cfg.get("beta_start", 1e-4)),
         beta_end=float(checkpoint_diffusion_cfg.get("beta_end", 2e-2)),
+        prediction_target=str(checkpoint_diffusion_cfg.get("prediction_target", "epsilon")),
     )
     diffusion = Diffusion(model=model, config=diffusion_config, device=device)
     return checkpoint, diffusion, diffusion_config, max_vertices

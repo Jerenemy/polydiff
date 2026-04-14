@@ -9,6 +9,8 @@ Current behavior:
 - `DenoiseMLP` is still fixed-size and operates on flattened `(B, 2n)` tensors
 - `DenoiseGAT` and `DenoiseGCN` now support variable-size polygons through ragged graph batches
 - variable-size GAT/GCN training and sampling use concatenated node tensors plus per-graph `num_vertices`, not padded storage
+- `DiffusionConfig.prediction_target` selects whether the denoiser learns `x0` directly or `epsilon`; the current training default is `x0`
+- checkpoint loading preserves that target, and legacy checkpoints without it are treated as epsilon-trained
 
 The conceptual discussion below still contains fixed-size examples because that was the original baseline setup, but the implementation status has changed. For a focused description of the current ragged GAT/GCN pipeline, see [`../../docs/variable_size_pipeline.md`](../../docs/variable_size_pipeline.md).
 
@@ -50,7 +52,9 @@ Configs:
 - `x_0`: clean polygon
 - `x_t`: polygon after adding noise at timestep `t`
 - `eps`: Gaussian noise used in the forward process
-- `eps_theta(x_t, t)`: model prediction of that noise
+- `x0_theta(x_t, t)`: model prediction of the clean polygon
+- `eps_theta(x_t, t)`: model prediction of the added noise
+- `u_theta(x_t, t)`: raw model output, which is either `x0_theta` or `eps_theta` depending on config
 - `T`: number of diffusion steps
 - `beta_t`: noise variance added at step `t`
 - `alpha_t = 1 - beta_t`
@@ -101,7 +105,7 @@ Relevant code:
 
 ### Intuition
 
-This is the baseline that ignores graph structure. It treats the whole polygon as one long coordinate vector and asks a standard MLP to infer the noise directly from that vector plus the timestep.
+This is the baseline that ignores graph structure. It treats the whole polygon as one long coordinate vector and asks a standard MLP to infer the configured diffusion target directly from that vector plus the timestep.
 
 This is a reasonable baseline when:
 
@@ -134,7 +138,7 @@ phi(t) = SiLU(W_t * SinusoidalPosEmb(t))
 Then the model is:
 
 ```text
-eps_theta(x_t, t) = f_MLP([x_t ; phi(t)])
+u_theta(x_t, t) = f_MLP([x_t ; phi(t)])
 ```
 
 where `[ ; ]` means concatenation.
@@ -304,30 +308,32 @@ Relevant code:
 
 - [`diffusion.py`](diffusion.py) lines 99-106
 
-However, the current active `forward(...)` path does not use those tensors. The model currently predicts per-node noise directly from `node_hidden`:
+If `use_global_features` is `false`, the model predicts the per-node diffusion target directly from `node_hidden`:
 
 ```text
-eps_hat_k = MLP(h_k^(L))
+u_hat_k = MLP(h_k^(L))
 ```
 
-Relevant code:
+If `use_global_features` is `true`, the model pools a graph summary, gates it back into each node, and predicts the diffusion target from the concatenated readout:
 
-- active per-node readout: [`diffusion.py`](diffusion.py) lines 201-218
-- commented-out old global-feature block: [`diffusion.py`](diffusion.py) lines 223-228
+```text
+g = global_head(mean_k h_k^(L))
+gamma_k = sigmoid([h_k^(L) ; g])
+u_hat_k = MLP([h_k^(L) ; gamma_k odot g])
+```
 
 Intuition:
 
-- the graph modules for pooled global context still exist in the class
-- but the current experiment is effectively a pure node-level GAT readout
-- this matches the current `node_head`, which takes `hidden_dim` inputs rather than `2 * hidden_dim`
+- with `use_global_features = false`, the experiment is a pure node-level GAT readout
+- with `use_global_features = true`, each node also receives a gated pooled graph summary before the final head
 
 ### Current concerns
 
 1. The graph is still very local.
    Even with several layers, global structure still has to emerge mostly through multi-hop local propagation.
 
-2. The previously tested mean-pooled global path was blunt.
-   It reduced some bad outliers, but it also tended to shrink variance and pull generation toward average shapes, which is why the current forward path bypasses it.
+2. The optional mean-pooled global path is blunt.
+   It can reduce bad outliers, but it can also shrink variance and pull generation toward average shapes if it dominates.
 
 3. There are no explicit long-range edges.
    Opposite or multi-hop relationships are not encoded directly.
@@ -353,7 +359,7 @@ This is the simpler graph baseline. Instead of learning attention weights, each 
 - previous neighbor
 - next neighbor
 
-Then a small MLP turns the final hidden state into the predicted 2D noise.
+Then a small MLP turns the final hidden state into the predicted 2D diffusion target.
 
 This makes the GCN easier to reason about, but also much more prone to oversmoothing.
 
@@ -374,9 +380,10 @@ So the GCN currently sees:
 It does not currently see:
 
 - cycle positional features
-- pooled global graph features
 - edge features
 - long-range edges
+
+If `use_global_features` is enabled, it does receive a pooled graph summary after message passing before the final node head.
 
 Relevant code:
 
@@ -417,10 +424,10 @@ where `R_l` is:
 - identity if widths match
 - linear projection otherwise
 
-Finally a per-node MLP predicts the 2D noise:
+Finally a per-node MLP predicts the 2D diffusion target:
 
 ```text
-eps_hat_k = MLP(h_k^(L))
+u_hat_k = MLP(h_k^(L))
 ```
 
 Relevant code:
@@ -438,11 +445,11 @@ Relevant code:
 2. Residuals help optimization, but not expressivity enough.
    They keep information alive, but the core message passing is still low-pass.
 
-3. No positional features and no global context.
+3. No positional features, and global context is optional rather than structural.
    That leaves the model weak on symmetry breaking and whole-polygon coordination.
 
 4. Empirically it has been the least promising denoiser so far.
-   This matches the theory: fixed averaging is a poor fit for detailed noise prediction.
+   This matches the theory: fixed averaging is a poor fit for detailed geometric denoising-target prediction.
 
 ## Why GNNs Can Be Counterproductive For Regular Hexagon Denoising
 
@@ -724,8 +731,9 @@ This stores:
 - `n_steps`
 - `beta_start`
 - `beta_end`
+- `prediction_target`
 
-Those determine the linear beta schedule used by the DDPM wrapper.
+Those determine the linear beta schedule and how the denoiser output is interpreted by the DDPM wrapper.
 
 ## `Diffusion`
 
@@ -745,7 +753,7 @@ The `Diffusion` class is the outer algorithm around the denoiser:
 - it turns the denoiser output into a reverse diffusion step at sampling time
 - it computes training statistics for debugging
 
-The denoiser predicts `eps`, but the `Diffusion` wrapper is what makes that prediction useful for DDPM training and ancestral sampling.
+The denoiser predicts a configurable diffusion target, but the `Diffusion` wrapper is what makes that prediction useful for DDPM training and ancestral sampling.
 
 ### Forward process
 
@@ -759,26 +767,42 @@ This is implemented in `q_sample(...)`.
 
 ### Reverse process
 
-The model predicts `eps_theta(x_t, t)`, and DDPM converts that into the reverse mean:
+The model output is first interpreted as either:
 
 ```text
-mu_theta(x_t, t) = (1 / sqrt(alpha_t)) * (x_t - (beta_t / sqrt(1 - bar_alpha_t)) * eps_theta(x_t, t))
+u_theta(x_t, t) = x0_theta(x_t, t)      # if prediction_target = x0
+u_theta(x_t, t) = eps_theta(x_t, t)     # if prediction_target = epsilon
 ```
 
-Then for `t > 0`:
+If the checkpoint is epsilon-trained, the wrapper converts it to a clean-sample estimate:
+
+```text
+x0_theta(x_t, t) = (x_t - sqrt(1 - bar_alpha_t) * eps_theta(x_t, t)) / sqrt(bar_alpha_t)
+```
+
+Then DDPM uses the posterior mean induced by `x0_theta`:
+
+```text
+mu_theta(x_t, t) =
+    [beta_t * sqrt(bar_alpha_{t-1}) / (1 - bar_alpha_t)] * x0_theta(x_t, t)
+  + [sqrt(alpha_t) * (1 - bar_alpha_{t-1}) / (1 - bar_alpha_t)] * x_t
+```
+
+Sampling uses:
 
 ```text
 x_{t-1} = mu_theta(x_t, t) + sqrt(tilde_beta_t) * z
 ```
 
-For `t = 0`, the code returns the mean directly.
+At `t = 0`, `tilde_beta_0 = 0`, so this reduces to the mean automatically.
 
 ### Training loss
 
-Training samples a random timestep and random Gaussian noise, constructs `x_t`, and minimizes:
+Training samples a random timestep and random Gaussian noise, constructs `x_t`, and minimizes one of:
 
 ```text
-L_simple = E[ || eps - eps_theta(x_t, t) ||^2 ]
+L_x0  = E[ || x_0 - x0_theta(x_t, t) ||^2 ]     # default
+L_eps = E[ || eps - eps_theta(x_t, t) ||^2 ]    # alternate
 ```
 
 The code also logs:
@@ -786,6 +810,7 @@ The code also logs:
 - `t_mean`, `t_std`
 - `x_t_std`
 - `noise_std`
+- `model_output_std`
 - `eps_pred_std`
 - `x0_pred_mse`
 

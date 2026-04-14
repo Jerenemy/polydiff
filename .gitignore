@@ -46,3 +46,6 @@ testpkg/
 *.jsonl
 
 plots/
+
+models/**/*.yaml
+models/**/*.json

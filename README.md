@@ -127,6 +127,13 @@ model:
   num_layers: 3
 ```
 
+The diffusion config also chooses the denoising target:
+
+```yaml
+diffusion:
+  prediction_target: x0   # x0 | epsilon ; "mean" is accepted as an alias for x0
+```
+
 Architecture/data compatibility:
 
 - `mlp`: fixed-size datasets only
@@ -146,7 +153,7 @@ Training writes:
 Checkpoints store:
 
 - model weights
-- diffusion schedule
+- diffusion schedule and `prediction_target`
 - `model_cfg`
 - `n_vertices` for fixed-size runs
 - `max_vertices` for GAT/GCN checkpoint reconstruction
@@ -159,6 +166,11 @@ Each training invocation creates a new numbered run directory. The suffix is gen
 
 That means sampling rebuilds the same denoiser architecture from the checkpoint automatically. You do not have to restate `model.type` in `configs/sample_diffusion.yaml`; the checkpoint drives reconstruction.
 
+The checkpoint also preserves which diffusion target was used during training:
+
+- new checkpoints store `prediction_target: x0` or `prediction_target: epsilon`
+- older checkpoints without that field are interpreted as epsilon-trained for backward compatibility
+
 Logged metrics include:
 
 - loss
@@ -166,6 +178,7 @@ Logged metrics include:
 - gradient norm
 - parameter norm
 - timestep statistics
+- `model_output_std`
 - `eps_pred_std`
 - `noise_std`
 - `x0_pred_mse`
@@ -359,7 +372,7 @@ Relevant files:
 
 ## Guidance
 
-The repo now supports optional sampling-time guidance. The denoiser still predicts noise as usual, but during reverse diffusion the sampler can add an extra gradient in `x`-space from a separate guidance model.
+The repo now supports optional sampling-time guidance. The denoiser may predict either `x_0` directly or `epsilon`, but during reverse diffusion the sampler always converts that output into the DDPM posterior mean and can then add an extra gradient in `x`-space from a separate guidance model.
 
 Intuition:
 
@@ -695,8 +708,8 @@ All three denoisers plug into the same DDPM wrapper in [`polydiff/models/diffusi
 
 Intuition:
 
-- Training picks a clean polygon `x_0`, adds a known amount of Gaussian noise, and asks the denoiser to predict exactly which noise was added.
-- Sampling starts from pure noise and repeatedly subtracts the model's estimated noise.
+- Training picks a clean polygon `x_0`, adds a known amount of Gaussian noise, and asks the denoiser to predict either `x_0` directly or the added noise.
+- Sampling starts from pure noise, converts the denoiser output into an `x_0` estimate, and then applies the DDPM posterior mean.
 - The denoiser architecture changes how the model reasons about polygon structure, but not the diffusion math around it.
 
 Core equations:
@@ -710,13 +723,24 @@ eps ~ N(0, I)
 Training objective:
 
 ```text
-L_simple = E[ || eps - eps_theta(x_t, t) ||^2 ]
+u_theta(x_t, t) = x0_theta(x_t, t)    # default
+L_x0 = E[ || x_0 - x0_theta(x_t, t) ||^2 ]
+
+or
+
+u_theta(x_t, t) = eps_theta(x_t, t)
+L_eps = E[ || eps - eps_theta(x_t, t) ||^2 ]
 ```
 
 Reverse step used at sampling time:
 
 ```text
-mu_theta(x_t, t) = (1 / sqrt(alpha_t)) * (x_t - (beta_t / sqrt(1 - bar_alpha_t)) * eps_theta(x_t, t))
+x0_theta(x_t, t) = u_theta(x_t, t)                                # if prediction_target = x0
+x0_theta(x_t, t) = (x_t - sqrt(1 - bar_alpha_t) * eps_theta) /
+                   sqrt(bar_alpha_t)                              # if prediction_target = epsilon
+
+mu_theta(x_t, t) = [beta_t * sqrt(bar_alpha_{t-1}) / (1 - bar_alpha_t)] * x0_theta(x_t, t)
+                 + [sqrt(alpha_t) * (1 - bar_alpha_{t-1}) / (1 - bar_alpha_t)] * x_t
 x_{t-1} = mu_theta(x_t, t) + sqrt(tilde_beta_t) * z
 z ~ N(0, I)
 ```
@@ -734,9 +758,9 @@ All denoisers implement the same interface:
 
 - input `x_t`: shape `(B, D)` where `D = 2 * n_vertices`
 - input `t`: shape `(B,)`
-- output: predicted noise with shape `(B, D)`
+- output: predicted diffusion target with shape `(B, D)`
 
-The diffusion wrapper itself does not care which denoiser is underneath. The architectural differences are entirely in how the model converts `(x_t, t)` into a noise prediction.
+The diffusion wrapper itself does not care which denoiser is underneath. The architectural differences are entirely in how the model converts `(x_t, t)` into a diffusion-target prediction.
 
 ### `DenoiseMLP`
 
@@ -748,13 +772,13 @@ Intuition:
 
 - Treat the polygon as one long vector.
 - Give the network the noisy coordinates and a description of "what timestep am I at?"
-- Let a standard MLP learn the mapping from noisy polygon to predicted noise.
+- Let a standard MLP learn the mapping from noisy polygon to the configured diffusion target.
 
 Math view:
 
 ```text
 phi(t) = SiLU(W_t * SinusoidalPosEmb(t))
-eps_hat = f_MLP([x_t ; phi(t)])
+u_hat = f_MLP([x_t ; phi(t)])
 ```
 
 Features used:
@@ -795,7 +819,7 @@ Intuition:
 - Turn the polygon into a ring graph where each vertex can talk to itself and its two immediate neighbors.
 - Give each vertex its current noisy coordinates, its place on the ring, and the diffusion timestep.
 - Use attention to decide which neighboring messages matter more for the current denoising step.
-- After local message passing, add a coarse whole-polygon summary and let each node decide how much of that global context to use.
+- Optionally add a coarse whole-polygon summary and let each node decide how much of that global context to use.
 
 Math view:
 
@@ -827,12 +851,18 @@ m_v = sum_{u in N(v)} alpha_uv * z_u
 
 Then the implementation applies skip connections and head concat or averaging inside the layer.
 
-After the GAT stack:
+After the GAT stack, if `use_global_features: false`:
+
+```text
+u_hat_k = MLP(h_k^(L))
+```
+
+If `use_global_features: true`:
 
 ```text
 g = psi(mean_k h_k^(L))
 gamma_k = sigmoid(W_g [h_k^(L) ; g])
-eps_hat_k = MLP([h_k^(L) ; gamma_k odot g])
+u_hat_k = MLP([h_k^(L) ; gamma_k odot g])
 ```
 
 where `psi` is `global_head`, `gamma_k` is the node-wise gate, and the final MLP predicts 2 numbers per node.
@@ -846,7 +876,7 @@ Every feature currently given to the GAT:
 5. `sin(4 * pi * k / n)`
 6. `cos(4 * pi * k / n)`
 7. The timestep embedding `phi(t)` repeated at every node
-8. A pooled graph feature after message passing, injected back through the gated global path
+8. Optionally, a pooled graph feature after message passing, injected back through the gated global path
 
 Important architectural details:
 
@@ -854,6 +884,7 @@ Important architectural details:
 - The final GAT layer uses 1 head and outputs a `hidden_dim` vector per node.
 - Skip connections are already enabled inside the imported `GAT` implementation.
 - The wrapper sets GAT dropout to `0.0`.
+- `use_global_features` controls whether the pooled graph summary is injected back before the node head; it defaults to `false`.
 - There are still no explicit edge features.
 
 Why these features help, intuitively:
@@ -861,13 +892,13 @@ Why these features help, intuitively:
 - Coordinates tell the model what the noisy polygon currently looks like.
 - Time embedding tells it how hard the denoising step should be.
 - Cycle harmonics tell it where a node sits around the ring without tying that position to absolute world-space orientation.
-- The pooled global feature gives a coarse "what kind of polygon is this overall?" summary.
-- The gate stops that global summary from being used at full strength everywhere.
+- The optional pooled global feature gives a coarse "what kind of polygon is this overall?" summary.
+- The gate stops that global summary from being used at full strength everywhere when the global path is enabled.
 
 Current concerns and limitations:
 
 - The topology is still only local cycle edges plus self-loops.
-- Global shape has to emerge through multi-hop local propagation, except for the coarse pooled summary.
+- Global shape has to emerge through multi-hop local propagation, unless the optional pooled summary is enabled.
 - The pooled summary can reduce outliers but also reduce variance if it dominates.
 - There are no long-range edges, no opposite-vertex connections, and no edge geometry features.
 - The positional features are fixed, not learned.
@@ -885,7 +916,7 @@ Intuition:
 
 - This is the simplest graph baseline: each node repeatedly averages information from itself and its two immediate neighbors.
 - Residuals keep the node state from being replaced entirely by that local average.
-- A small per-node MLP makes the final `(x, y)` prediction after message passing.
+- A small per-node MLP makes the final 2D diffusion-target prediction after message passing.
 
 Math view:
 
@@ -910,10 +941,18 @@ h^(l+1) = SiLU(tilde_h^(l+1) + R_l(h^(l)))
 
 where `R_l` is either identity or a learned linear projection.
 
-Final node prediction:
+Final node prediction, if `use_global_features: false`:
 
 ```text
-eps_hat_k = MLP(h_k^(L))
+u_hat_k = MLP(h_k^(L))
+```
+
+If `use_global_features: true`:
+
+```text
+g = psi(mean_k h_k^(L))
+gamma_k = sigmoid(W_g [h_k^(L) ; g])
+u_hat_k = MLP([h_k^(L) ; gamma_k odot g])
 ```
 
 Every feature currently given to the GCN:
@@ -921,11 +960,11 @@ Every feature currently given to the GCN:
 1. Noisy `x` coordinate
 2. Noisy `y` coordinate
 3. The timestep embedding `phi(t)` repeated at every node
+4. Optionally, a pooled global graph feature after message passing
 
 What it does not currently get:
 
 - cycle positional features
-- pooled global features
 - edge features
 - long-range edges
 

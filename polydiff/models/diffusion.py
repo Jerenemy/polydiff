@@ -32,11 +32,32 @@ class SinusoidalPosEmb(nn.Module):
         return emb
 
 
+def normalize_prediction_target(value: Any) -> str:
+    target = str(value).strip().lower().replace("-", "_")
+    aliases = {
+        "epsilon": "epsilon",
+        "eps": "epsilon",
+        "noise": "epsilon",
+        "epsilon_prediction": "epsilon",
+        "x0": "x0",
+        "x_0": "x0",
+        "mean": "x0",
+        "mean_prediction": "x0",
+    }
+    normalized = aliases.get(target)
+    if normalized is None:
+        raise ValueError(
+            "prediction_target must be one of: epsilon, eps, noise, x0, x_0, mean; "
+            f"got {value!r}"
+        )
+    return normalized
+
+
 class DenoiseMLP(nn.Module):
     def __init__(self, data_dim: int, hidden_dim: int, time_emb_dim: int, num_layers: int) -> None:
         super().__init__()
         # build a small network that turns the timestep t into a learnable embedded vector 
-        # (think of this as like a kernel param in a cnn. it needs to have t embedded in a way that makes it easiest to predict the noise added)
+        # so the denoiser can condition its output on the diffusion step.
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(time_emb_dim),                 # fixed Fourier features of t transformed to each have time_emb_dim features: (Batch,) -> (Batch, time_emb_dim)
             nn.Linear(time_emb_dim, time_emb_dim),          # learnable affine mix of those features
@@ -49,13 +70,13 @@ class DenoiseMLP(nn.Module):
             layers.append(nn.Linear(in_dim, hidden_dim))    # affine map: R^{in_dim} -> R^{hidden_dim} (eg input vects from R^2 output to R^8)
             layers.append(nn.SiLU())                        # nonlinearity
             in_dim = hidden_dim                             # next layer expects hidden_dim inputs
-        layers.append(nn.Linear(hidden_dim, data_dim))      # output predicted noise eps_hat with same dim as x_t
+        layers.append(nn.Linear(hidden_dim, data_dim))      # output predicted diffusion target with same dim as x_t
         self.net = nn.Sequential(*layers)                   # bundle all layers into one module
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         emb = self.time_mlp(t)                              # compute time embedding from t: (B,) -> (B, time_emb_dim)
         h = torch.cat([x, emb], dim=1)                      # concatenate features: (B, data_dim + time_emb_dim)
-        return self.net(h)                                  # predict eps_hat: (B, data_dim)
+        return self.net(h)                                  # predict the configured diffusion target: (B, data_dim)
 
 
 def _graph_batch_from_dense_flattened(
@@ -234,10 +255,10 @@ class DenoiseGAT(nn.Module):
         else:
             node_readout = node_hidden
 
-        node_noise = self.node_head(node_readout)
+        node_output = self.node_head(node_readout)
         if return_dense:
-            return node_noise.reshape(batch_size, self.data_dim)
-        return node_noise
+            return node_output.reshape(batch_size, self.data_dim)
+        return node_output
 
 
 class DenoiseGCN(nn.Module):
@@ -341,10 +362,10 @@ class DenoiseGCN(nn.Module):
         else:
             node_readout = h
 
-        node_noise = self.node_head(node_readout)
+        node_output = self.node_head(node_readout)
         if return_dense:
-            return node_noise.reshape(batch_size, self.data_dim)
-        return node_noise
+            return node_output.reshape(batch_size, self.data_dim)
+        return node_output
 
 
 def build_denoiser(*, data_dim: int, model_cfg: Mapping[str, Any] | None = None) -> nn.Module:
@@ -387,6 +408,10 @@ class DiffusionConfig:
     n_steps: int = 1000
     beta_start: float = 1e-4
     beta_end: float = 2e-2
+    prediction_target: str = "x0"
+
+    def __post_init__(self) -> None:
+        self.prediction_target = normalize_prediction_target(self.prediction_target)
 
 
 GuidanceGradFn = Callable[..., torch.Tensor]
@@ -425,14 +450,17 @@ class Diffusion:
         
         # sqrt(1-ᾱ_t) coefficient used in same closed-form forward diffusion
         self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
-        
-        # sqrt(1/α_t) used in reverse mean computation (undoing the per-step scaling)
-        self.sqrt_recip_alphas = torch.sqrt(1.0 / alphas)
-        
+
         # posterior_variance: Var[q(x_{t-1} | x_t, x_0)] for DDPM reverse sampling
         # β̃_t = β_t * (1-ᾱ_{t-1}) / (1-ᾱ_t)
         self.posterior_variance = (
             betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        )
+        self.posterior_mean_coef1 = (
+            betas * torch.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        )
+        self.posterior_mean_coef2 = (
+            torch.sqrt(alphas) * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
         )
 
     def _resolve_n_steps(self, n_steps: Optional[int]) -> int:
@@ -440,6 +468,15 @@ class Diffusion:
         if steps < 1 or steps > self.config.n_steps:
             raise ValueError(f"n_steps must be in [1, {self.config.n_steps}], got {steps}")
         return steps
+
+    def _effective_t(self, t: torch.Tensor, *, graph_batch: PolygonGraphBatch | None = None) -> torch.Tensor:
+        if graph_batch is None:
+            return t
+        return t.index_select(0, graph_batch.graph_index)
+
+    def _gather_schedule(self, values: torch.Tensor, t: torch.Tensor, *, graph_batch: PolygonGraphBatch | None = None) -> torch.Tensor:
+        effective_t = self._effective_t(t, graph_batch=graph_batch)
+        return values[effective_t].unsqueeze(1)
 
     def q_sample(
         self,
@@ -450,16 +487,50 @@ class Diffusion:
         graph_batch: PolygonGraphBatch | None = None,
     ) -> torch.Tensor:
         """Forward diffusion (adding noise). Create x_t in in one shot"""
-        if graph_batch is None:
-            sqrt_ab = self.sqrt_alphas_cumprod[t].unsqueeze(1)              # gather sqrt(ᾱ_t) per sample, shape (B,1)
-            sqrt_omab = self.sqrt_one_minus_alphas_cumprod[t].unsqueeze(1)  # gather sqrt(1-ᾱ_t) per sample, shape (B,1)
-        else:
-            node_t = t.index_select(0, graph_batch.graph_index)
-            sqrt_ab = self.sqrt_alphas_cumprod[node_t].unsqueeze(1)
-            sqrt_omab = self.sqrt_one_minus_alphas_cumprod[node_t].unsqueeze(1)
+        sqrt_ab = self._gather_schedule(self.sqrt_alphas_cumprod, t, graph_batch=graph_batch)
+        sqrt_omab = self._gather_schedule(self.sqrt_one_minus_alphas_cumprod, t, graph_batch=graph_batch)
         
         # x_t = sqrt(ᾱ_t) * x_0 + sqrt(1-ᾱ_t) * ε
         return sqrt_ab * x0 + sqrt_omab * noise
+
+    def predict_model_output(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        *,
+        graph_batch: PolygonGraphBatch | None = None,
+    ) -> torch.Tensor:
+        if graph_batch is None:
+            return self.model(x_t, t)
+        return self.model(x_t, t, batch=graph_batch)
+
+    def _model_output_to_x0(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        model_output: torch.Tensor,
+        *,
+        graph_batch: PolygonGraphBatch | None = None,
+    ) -> torch.Tensor:
+        if self.config.prediction_target == "x0":
+            return model_output
+        sqrt_ab = self._gather_schedule(self.sqrt_alphas_cumprod, t, graph_batch=graph_batch)
+        sqrt_omab = self._gather_schedule(self.sqrt_one_minus_alphas_cumprod, t, graph_batch=graph_batch)
+        return (x_t - sqrt_omab * model_output) / sqrt_ab.clamp_min(1e-8)
+
+    def _model_output_to_eps(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        model_output: torch.Tensor,
+        *,
+        graph_batch: PolygonGraphBatch | None = None,
+    ) -> torch.Tensor:
+        if self.config.prediction_target == "epsilon":
+            return model_output
+        sqrt_ab = self._gather_schedule(self.sqrt_alphas_cumprod, t, graph_batch=graph_batch)
+        sqrt_omab = self._gather_schedule(self.sqrt_one_minus_alphas_cumprod, t, graph_batch=graph_batch)
+        return (x_t - sqrt_ab * model_output) / sqrt_omab.clamp_min(1e-8)
 
     def predict_eps(
         self,
@@ -468,9 +539,30 @@ class Diffusion:
         *,
         graph_batch: PolygonGraphBatch | None = None,
     ) -> torch.Tensor:
-        if graph_batch is None:
-            return self.model(x_t, t)  # eps_hat = model(x_t, t)
-        return self.model(x_t, t, batch=graph_batch)
+        model_output = self.predict_model_output(x_t, t, graph_batch=graph_batch)
+        return self._model_output_to_eps(x_t, t, model_output, graph_batch=graph_batch)
+
+    def predict_x0(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        *,
+        graph_batch: PolygonGraphBatch | None = None,
+    ) -> torch.Tensor:
+        model_output = self.predict_model_output(x_t, t, graph_batch=graph_batch)
+        return self._model_output_to_x0(x_t, t, model_output, graph_batch=graph_batch)
+
+    def q_posterior_mean(
+        self,
+        x0_pred: torch.Tensor,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        *,
+        graph_batch: PolygonGraphBatch | None = None,
+    ) -> torch.Tensor:
+        coef1 = self._gather_schedule(self.posterior_mean_coef1, t, graph_batch=graph_batch)
+        coef2 = self._gather_schedule(self.posterior_mean_coef2, t, graph_batch=graph_batch)
+        return coef1 * x0_pred + coef2 * x_t
 
     def p_sample(
         self,
@@ -481,21 +573,13 @@ class Diffusion:
         graph_batch: PolygonGraphBatch | None = None,
     ) -> torch.Tensor:
         """Reverse diffusion step: sample x_{t-1} from learned p(x_{t-1} | x_t)."""
-        if graph_batch is None:
-            effective_t = t
-        else:
-            effective_t = t.index_select(0, graph_batch.graph_index)
-
-        betas_t = self.betas[effective_t].unsqueeze(1)                        # gather β_t per sample, shape (...,1)
-        sqrt_recip_alpha_t = self.sqrt_recip_alphas[effective_t].unsqueeze(1) # gather sqrt(1/α_t), shape (...,1)
-        sqrt_omab_t = self.sqrt_one_minus_alphas_cumprod[effective_t].unsqueeze(1) # gather sqrt(1-ᾱ_t), shape (...,1)
+        effective_t = self._effective_t(t, graph_batch=graph_batch)
         posterior_var_t = self.posterior_variance[effective_t].unsqueeze(1)   # gather β̃_t per sample, shape (...,1)
 
-        eps_pred = self.predict_eps(x_t, t, graph_batch=graph_batch)                         # model predicts ε_hat(x_t, t)
-        
-        # DDPM mean:
-        # μθ(x_t,t) = (1/sqrt(α_t)) * (x_t - (β_t / sqrt(1-ᾱ_t)) * ε_hat)
-        model_mean = sqrt_recip_alpha_t * (x_t - betas_t * eps_pred / sqrt_omab_t)
+        model_output = self.predict_model_output(x_t, t, graph_batch=graph_batch)
+        x0_pred = self._model_output_to_x0(x_t, t, model_output, graph_batch=graph_batch)
+        # Use the DDPM posterior mean induced by the predicted clean sample.
+        model_mean = self.q_posterior_mean(x0_pred, x_t, t, graph_batch=graph_batch)
 
         if guidance_grad is not None:
             if graph_batch is None:
@@ -508,10 +592,6 @@ class Diffusion:
                 )
             # Classifier guidance shifts the reverse mean in x-space using ∇_x log p(y | x_t).
             model_mean = model_mean + posterior_var_t * grad
-
-        # At t=0, return the mean (no noise added in the final step)
-        if t.min().item() == 0:
-            return model_mean
 
         noise = torch.randn_like(x_t)        
         
@@ -696,28 +776,23 @@ class Diffusion:
         graph_batch: PolygonGraphBatch | None = None,
         return_stats: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
-        """Training loss: predict the noise used to create x_t from x_0."""
+        """Training loss: predict either epsilon or x_0 from x_t, depending on config."""
         b = graph_batch.batch_size if graph_batch is not None else x0.shape[0]     # batch size B
         
         # sample t ~ Uniform{0,...,T-1} independently for each batch element
         t = torch.randint(0, self.config.n_steps, (b,), device=self.device, dtype=torch.long)
         noise = torch.randn_like(x0)        # sample ε ~ N(0,I) same shape as x0
         x_t = self.q_sample(x0, t, noise, graph_batch=graph_batch)   # create noisy inputs x_t from x0 and ε
-        eps_pred = self.predict_eps(x_t, t, graph_batch=graph_batch) # predict ε_hat(x_t, t)
+        model_output = self.predict_model_output(x_t, t, graph_batch=graph_batch)
+        x0_pred = self._model_output_to_x0(x_t, t, model_output, graph_batch=graph_batch)
+        eps_pred = self._model_output_to_eps(x_t, t, model_output, graph_batch=graph_batch)
         
-        # minimize mean squared error: ||ε_hat - ε||^2
-        loss = nn.functional.mse_loss(eps_pred, noise)
+        if self.config.prediction_target == "epsilon":
+            loss = nn.functional.mse_loss(model_output, noise)
+        else:
+            loss = nn.functional.mse_loss(model_output, x0)
         if not return_stats:
             return loss
-
-        if graph_batch is None:
-            sqrt_ab = self.sqrt_alphas_cumprod[t].unsqueeze(1)
-            sqrt_omab = self.sqrt_one_minus_alphas_cumprod[t].unsqueeze(1)
-        else:
-            node_t = t.index_select(0, graph_batch.graph_index)
-            sqrt_ab = self.sqrt_alphas_cumprod[node_t].unsqueeze(1)
-            sqrt_omab = self.sqrt_one_minus_alphas_cumprod[node_t].unsqueeze(1)
-        x0_pred = (x_t - sqrt_omab * eps_pred) / sqrt_ab.clamp_min(1e-8)
 
         stats = {
             "loss": float(loss.detach().item()),
@@ -725,6 +800,7 @@ class Diffusion:
             "t_std": float(t.float().std(unbiased=False).item()),
             "x_t_std": float(x_t.detach().std(unbiased=False).item()),
             "noise_std": float(noise.detach().std(unbiased=False).item()),
+            "model_output_std": float(model_output.detach().std(unbiased=False).item()),
             "eps_pred_std": float(eps_pred.detach().std(unbiased=False).item()),
             "x0_pred_mse": float(nn.functional.mse_loss(x0_pred, x0).detach().item()),
         }

@@ -20,6 +20,7 @@ diffusion:
   n_steps: 50
   beta_start: 0.0001
   beta_end: 0.02
+  prediction_target: x0 # x0 | epsilon ; "mean" is accepted as an alias for x0
 
 training:
   epochs: 40

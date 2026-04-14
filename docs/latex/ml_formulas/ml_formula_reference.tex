@@ -1,0 +1,982 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts,mathtools,bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{hyperref}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue
+}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\sigmoid}{\operatorname{sigmoid}}
+\newcommand{\SiLU}{\operatorname{SiLU}}
+\newcommand{\ReLU}{\operatorname{ReLU}}
+\newcommand{\ELU}{\operatorname{ELU}}
+\newcommand{\CV}{\operatorname{CV}}
+\newcommand{\diag}{\operatorname{diag}}
+
+\title{Machine Learning Formula Reference For This Project}
+\author{PolyDiff / Pocket Conditioning / Affinity Surrogates}
+\date{Generated from the repository implementation}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section{Scope}
+This document collects the mathematically explicit learning-related formulas implemented in the repository. It covers the main \texttt{polydiff/} package, the pocket-conditioning branch, and the ligand-context surrogate models in \texttt{predict\_binding\_affinity/}. It intentionally omits plotting-only algebra, file-management logic, and other bookkeeping that does not define a learned model, an optimized objective, a differentiable reward, or an evaluation metric.
+
+\section{Shared Notation}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.18\linewidth} >{\raggedright\arraybackslash}p{0.74\linewidth}}
+\toprule
+Symbol & Meaning \\
+\midrule
+$x_0$ & Clean polygon coordinates. In dense form, $x_0 \in \R^{2n}$ or $x_0 \in \R^{n \times 2}$. \\
+$x_t$ & Polygon coordinates after forward diffusion step $t$. \\
+$t$ & Diffusion timestep, typically sampled from $\{0,1,\dots,T-1\}$. \\
+$\beta_t$ & Diffusion noise variance at step $t$. \\
+$\alpha_t$ & Signal retention coefficient, $\alpha_t = 1 - \beta_t$. \\
+$\bar{\alpha}_t$ & Cumulative signal retention, $\bar{\alpha}_t = \prod_{s=0}^t \alpha_s$. \\
+$\tilde{\beta}_t$ & Posterior variance used in reverse DDPM sampling. \\
+$\epsilon$ & Gaussian noise with the same shape as the coordinates being corrupted. \\
+$\hat{x}_{0,\theta}$ & Model prediction of the clean sample $x_0$. \\
+$\hat{\epsilon}_\theta$ & Model prediction of diffusion noise. \\
+$\hat{u}_\theta$ & Raw denoiser output; depending on configuration, this is either $\hat{x}_{0,\theta}$ or $\hat{\epsilon}_\theta$. \\
+$h_i$ & Hidden feature vector at node $i$. \\
+$\mathcal{N}(i)$ & Neighborhood of node $i$. \\
+$n$ & Number of ligand vertices in a polygon. \\
+$B$ & Batch size. \\
+$V_g$ & Vertex set of graph $g$. \\
+$\|\cdot\|$ & Euclidean norm. \\
+\bottomrule
+\end{tabular}
+
+\section{Core DDPM Formulas}
+\subsection{Linear Variance Schedule}
+The diffusion schedule in \texttt{polydiff/models/diffusion.py} is
+\begin{align}
+\beta_t &= \beta_{\mathrm{start}} + \frac{t}{T-1}\left(\beta_{\mathrm{end}} - \beta_{\mathrm{start}}\right), \\
+\alpha_t &= 1 - \beta_t, \\
+\bar{\alpha}_t &= \prod_{s=0}^{t} \alpha_s, \\
+\tilde{\beta}_t &= \beta_t \frac{1 - \bar{\alpha}_{t-1}}{1 - \bar{\alpha}_t},
+\end{align}
+with $\bar{\alpha}_{-1} \equiv 1$.
+
+\subsection{Forward Diffusion}
+The closed-form forward corruption used by \texttt{q\_sample} is
+\begin{equation}
+x_t = \sqrt{\bar{\alpha}_t}\,x_0 + \sqrt{1-\bar{\alpha}_t}\,\epsilon,
+\qquad \epsilon \sim \mathcal{N}(0, I).
+\end{equation}
+
+\subsection{Sinusoidal Timestep Embedding}
+The shared timestep embedding in \texttt{SinusoidalPosEmb} uses frequencies
+\begin{equation}
+\omega_i = \exp\!\left(-\log(10000)\,\frac{i}{H-1}\right),
+\qquad i = 0,\dots,H-1,
+\end{equation}
+where $H = \lfloor d/2 \rfloor$. For timestep $t$ the embedding is
+\begin{equation}
+\phi(t) =
+\left[
+\sin(t \omega_0), \dots, \sin(t \omega_{H-1}),
+\cos(t \omega_0), \dots, \cos(t \omega_{H-1})
+\right].
+\end{equation}
+This embedding is then passed through
+\begin{equation}
+\psi(t) = \SiLU\!\left(W_t \phi(t) + b_t\right)
+\end{equation}
+or a slightly deeper variant in some surrogate models.
+
+\subsection{Training Objective And Parameterization}
+Training samples a timestep uniformly,
+\begin{equation}
+t \sim \mathrm{Uniform}\left(\{0,1,\dots,T-1\}\right),
+\end{equation}
+corrupts the clean input to $x_t$, and then optimizes one of two parameterizations selected by the configuration field \texttt{diffusion.prediction\_target}.
+
+In the default direct-clean-sample mode,
+\begin{equation}
+\hat{u}_\theta(x_t,t) = \hat{x}_{0,\theta}(x_t,t),
+\end{equation}
+and the loss is
+\begin{equation}
+\mathcal{L}_{x_0}(\theta)
+=
+\E_{x_0,\,t,\,\epsilon}
+\left[
+\left\|
+\hat{x}_{0,\theta}(x_t,t) - x_0
+\right\|_2^2
+\right].
+\end{equation}
+
+In the alternate epsilon-parameterized mode,
+\begin{equation}
+\hat{u}_\theta(x_t,t) = \hat{\epsilon}_\theta(x_t,t),
+\end{equation}
+and the loss is
+\begin{equation}
+\mathcal{L}_{\epsilon}(\theta)
+=
+\E_{x_0,\,t,\,\epsilon}
+\left[
+\left\|
+\hat{\epsilon}_\theta(x_t,t) - \epsilon
+\right\|_2^2
+\right].
+\end{equation}
+
+The two parameterizations are converted by
+\begin{equation}
+\hat{x}_0 = \frac{x_t - \sqrt{1-\bar{\alpha}_t}\,\hat{\epsilon}_\theta(x_t,t)}{\sqrt{\bar{\alpha}_t}},
+\end{equation}
+and equivalently
+\begin{equation}
+\hat{\epsilon}_\theta(x_t,t)
+=
+\frac{x_t - \sqrt{\bar{\alpha}_t}\,\hat{x}_{0,\theta}(x_t,t)}{\sqrt{1-\bar{\alpha}_t}}.
+\end{equation}
+
+For logging, the code always forms a clean-sample estimate $\hat{x}_0$ and reports the auxiliary metric
+\begin{equation}
+\mathrm{x0\_pred\_mse} = \left\|\hat{x}_0 - x_0\right\|_2^2.
+\end{equation}
+It also logs the standard deviations of the true noise, the raw model output, and the implied epsilon prediction.
+
+\subsection{Reverse Diffusion Mean And Sampling Rule}
+Reverse diffusion always computes the mean from a predicted clean sample. The posterior mean used by \texttt{p\_sample} is
+\begin{equation}
+\mu_\theta(x_t,t)
+=
+\frac{\beta_t \sqrt{\bar{\alpha}_{t-1}}}{1-\bar{\alpha}_t}\,\hat{x}_{0,\theta}(x_t,t)
++
+\frac{\sqrt{\alpha_t}(1-\bar{\alpha}_{t-1})}{1-\bar{\alpha}_t}\,x_t.
+\end{equation}
+
+If the checkpoint was trained in epsilon mode, the sampler first converts $\hat{\epsilon}_\theta$ into $\hat{x}_{0,\theta}$ using the relation above, then applies the same posterior-mean formula. Thus both training targets share the same ancestral sampler after conversion to $\hat{x}_{0,\theta}$.
+
+Without guidance, sampling uses
+\begin{equation}
+x_{t-1}
+=
+\mu_\theta(x_t,t) + \sqrt{\tilde{\beta}_t}\,z,
+\qquad z \sim \mathcal{N}(0,I).
+\end{equation}
+This same equation applies at $t=0$ because $\tilde{\beta}_0 = 0$.
+
+\section{Polygon Representations And Shared Geometry Features}
+\subsection{Dense And Graph Forms}
+For the MLP denoiser, a polygon with $n$ vertices is flattened as
+\begin{equation}
+x = [x_1, y_1, x_2, y_2, \dots, x_n, y_n] \in \R^{2n}.
+\end{equation}
+
+For GAT and GCN models, polygons are represented as cycle graphs with node coordinates
+\begin{equation}
+v_i = (x_i, y_i) \in \R^2,
+\qquad
+E = \{(i,i), (i,i+1), (i,i-1)\},
+\end{equation}
+with indices interpreted modulo $n$.
+
+\subsection{Cycle Positional Encoding}
+Each polygon node also receives a hand-built cycle encoding
+\begin{equation}
+p_i =
+\left[
+\sin\!\left(\frac{2\pi i}{n}\right),
+\cos\!\left(\frac{2\pi i}{n}\right),
+\sin\!\left(\frac{4\pi i}{n}\right),
+\cos\!\left(\frac{4\pi i}{n}\right)
+\right].
+\end{equation}
+
+\subsection{Graph Mean Pooling}
+Whenever the code pools node features by mean, it computes
+\begin{equation}
+\mathrm{MeanPool}(G)
+=
+\frac{1}{|V_G|}
+\sum_{i \in V_G} h_i.
+\end{equation}
+Other pooling variants used in the surrogate branches are
+\begin{align}
+\mathrm{SumPool}(G) &= \sum_{i \in V_G} h_i, \\
+\mathrm{MaxPool}(G) &= \max_{i \in V_G} h_i.
+\end{align}
+
+\section{Polygon Denoisers}
+\subsection{MLP Denoiser}
+The dense denoiser concatenates the flattened polygon with its time embedding:
+\begin{equation}
+h^{(0)} = [x_t ; \psi(t)].
+\end{equation}
+Then for each hidden layer $\ell$,
+\begin{equation}
+h^{(\ell)} = \SiLU\!\left(W^{(\ell)} h^{(\ell-1)} + b^{(\ell)}\right),
+\end{equation}
+and the output layer predicts the configured diffusion target:
+\begin{equation}
+\hat{u}_\theta(x_t,t) = W_{\mathrm{out}} h^{(L)} + b_{\mathrm{out}}.
+\end{equation}
+
+\subsection{GCN Denoiser}
+The GCN denoiser starts from node features
+\begin{equation}
+h_i^{(0)} = [v_i ; \psi(t_g)],
+\end{equation}
+where $t_g$ is the timestep associated with the polygon containing node $i$.
+
+The cycle adjacency used in \texttt{\_cycle\_adj} is
+\begin{equation}
+A_{ij} =
+\begin{cases}
+\frac{1}{3}, & j \in \{i-1, i, i+1\}, \\
+0, & \text{otherwise}.
+\end{cases}
+\end{equation}
+
+Each graph-convolution layer computes
+\begin{equation}
+\tilde{h}^{(\ell+1)} = A h^{(\ell)} W^{(\ell)} + b^{(\ell)},
+\end{equation}
+adds a residual projection $R^{(\ell)} h^{(\ell)}$, and applies $\SiLU$:
+\begin{equation}
+h^{(\ell+1)} = \SiLU\!\left(\tilde{h}^{(\ell+1)} + R^{(\ell)} h^{(\ell)}\right).
+\end{equation}
+
+If global features are enabled, the model computes
+\begin{align}
+g_G &= \SiLU\!\left(W_g\,\mathrm{MeanPool}(G) + b_g\right), \\
+\gamma_i &= \sigmoid\!\left(W_\gamma [h_i ; g_G] + b_\gamma\right), \\
+r_i &= [h_i ; \gamma_i \odot g_G].
+\end{align}
+Otherwise $r_i = h_i$. The per-node diffusion-target prediction is then
+\begin{equation}
+\hat{u}_{\theta,i}
+=
+W_2\,\SiLU(W_1 r_i + b_1) + b_2.
+\end{equation}
+
+\subsection{GAT Denoiser}
+The GAT denoiser uses node features
+\begin{equation}
+h_i^{(0)} = [v_i ; p_i ; \psi(t_g)].
+\end{equation}
+
+For head $k$ in a GAT layer,
+\begin{align}
+\tilde{h}_i^{(k)} &= W^{(k)} h_i, \\
+e_{ij}^{(k)} &=
+\mathrm{LeakyReLU}\!\left(
+\langle a_{\mathrm{src}}^{(k)}, \tilde{h}_i^{(k)} \rangle
++
+\langle a_{\mathrm{trg}}^{(k)}, \tilde{h}_j^{(k)} \rangle
+\right), \\
+\alpha_{ij}^{(k)}
+&=
+\frac{\exp(e_{ij}^{(k)})}
+{\sum\limits_{u \in \mathcal{N}(j)} \exp(e_{uj}^{(k)})}.
+\end{align}
+The implementation applies the softmax over incoming edges to each target node.
+
+Neighborhood aggregation is
+\begin{equation}
+m_j^{(k)} = \sum_{i \in \mathcal{N}(j)} \alpha_{ij}^{(k)} \tilde{h}_i^{(k)}.
+\end{equation}
+Then the layer applies optional skip connections, head concatenation or averaging, bias, and optionally an $\ELU$ nonlinearity on non-final layers.
+
+With global features enabled, the same global pooling-and-gating mechanism as the GCN branch is used:
+\begin{align}
+g_G &= \SiLU\!\left(W_g\,\mathrm{MeanPool}(G) + b_g\right), \\
+\gamma_i &= \sigmoid\!\left(W_\gamma [h_i ; g_G] + b_\gamma\right), \\
+r_i &= [h_i ; \gamma_i \odot g_G].
+\end{align}
+The final per-node head again predicts a 2D diffusion-target vector.
+
+\section{Guidance-Model Training}
+\subsection{Noisy Inputs For Classifier And Regressor Training}
+The guidance classifier/regressor is trained on noisy polygons, not clean ones. The noisy input is generated with the same forward diffusion equation:
+\begin{equation}
+x_t = \sqrt{\bar{\alpha}_t}\,x_0 + \sqrt{1-\bar{\alpha}_t}\,\epsilon.
+\end{equation}
+
+\subsection{Classifier Labels}
+For threshold-based classifier training, the binary label is
+\begin{equation}
+y =
+\mathbf{1}\!\left[s(x_0) \ge \tau\right],
+\end{equation}
+where $s(x_0)$ is the polygon regularity score and $\tau$ is the configured score threshold.
+
+With classifier logits $z(x_t,t)$, the loss is standard cross-entropy:
+\begin{equation}
+\mathcal{L}_{\mathrm{clf}}
+=
+- \log
+\frac{\exp(z_y)}{\sum_c \exp(z_c)}.
+\end{equation}
+
+\subsection{Regressor Targets}
+For score regression, the target is the scalar regularity score itself:
+\begin{equation}
+y = s(x_0),
+\end{equation}
+and training uses mean squared error:
+\begin{equation}
+\mathcal{L}_{\mathrm{reg}} = \left(\hat{y}(x_t,t) - y\right)^2.
+\end{equation}
+
+\subsection{Guidance Model Architectures}
+The MLP classifier/regressor uses the same trunk pattern as the dense denoiser:
+\begin{equation}
+h^{(0)} = [x_t ; \psi(t)],
+\qquad
+h^{(\ell)} = \SiLU(W^{(\ell)} h^{(\ell-1)} + b^{(\ell)}),
+\end{equation}
+followed by either
+\begin{equation}
+z = W_{\mathrm{cls}} h^{(L)} + b_{\mathrm{cls}}
+\end{equation}
+for classifier logits, or
+\begin{equation}
+\hat{y} = W_{\mathrm{reg}} h^{(L)} + b_{\mathrm{reg}}
+\end{equation}
+for regression.
+
+The graph classifier/regressor reuses the same cycle-node features as the GAT/GCN denoisers:
+\begin{equation}
+h_i^{(0)} = [v_i ; p_i ; \psi(t_g)],
+\end{equation}
+passes them through either a GAT or GCN trunk, pools graph features by mean, max, or sum,
+\begin{equation}
+g_G = \mathrm{Pool}\left(\{h_i : i \in V_G\}\right),
+\end{equation}
+and then maps $g_G$ to logits or a scalar regression prediction with a linear head.
+
+\section{Sampling-Time Guidance}
+\subsection{Guided Reverse Mean}
+All guidance terms are gradients in $x$-space. If a guidance field returns $g(x_t,t)$, the reverse mean becomes
+\begin{equation}
+\mu_\theta^{\mathrm{guided}}(x_t,t)
+=
+\mu_\theta(x_t,t) + \tilde{\beta}_t\,g(x_t,t).
+\end{equation}
+
+\subsection{Classifier Guidance}
+If the classifier predicts logits $z(x_t,t)$ and target class $c^\star$, the code computes
+\begin{equation}
+g_{\mathrm{clf}}(x_t,t)
+=
+\lambda \nabla_{x_t}
+\log
+\left(
+\frac{\exp(z_{c^\star}(x_t,t))}
+{\sum_c \exp(z_c(x_t,t))}
+\right),
+\end{equation}
+where $\lambda$ is the configured guidance scale.
+
+\subsection{Regressor Guidance}
+If the regressor predicts $\hat{y}(x_t,t)$, then
+\begin{equation}
+g_{\mathrm{reg}}(x_t,t)
+=
+\lambda \nabla_{x_t} \hat{y}(x_t,t)
+\end{equation}
+when maximizing the prediction. If a target value $y^\star$ is specified, the objective becomes
+\begin{equation}
+g_{\mathrm{reg}}(x_t,t)
+=
+\lambda \nabla_{x_t}
+\left(
+-\left(\hat{y}(x_t,t) - y^\star\right)^2
+\right).
+\end{equation}
+
+\subsection{Analytic Regularity Guidance}
+The analytic regularity guidance is the gradient of the regularity score:
+\begin{equation}
+g_{\mathrm{regscore}}(x_t,t)
+=
+\lambda \nabla_{x_t} s(x_t),
+\end{equation}
+or, with a target value $s^\star$,
+\begin{equation}
+g_{\mathrm{regscore}}(x_t,t)
+=
+\lambda \nabla_{x_t}
+\left(
+-\left(s(x_t) - s^\star\right)^2
+\right).
+\end{equation}
+
+\subsection{Analytic Area Guidance}
+If $A(x_t)$ is the differentiable polygon area defined below, then
+\begin{equation}
+g_{\mathrm{area}}(x_t,t)
+=
+\lambda \nabla_{x_t} A(x_t),
+\end{equation}
+or, if an area target $A^\star$ is specified,
+\begin{equation}
+g_{\mathrm{area}}(x_t,t)
+=
+\lambda \nabla_{x_t}
+\left(
+-\left(A(x_t) - A^\star\right)^2
+\right).
+\end{equation}
+
+\subsection{Guidance Scheduling}
+The code defines progress as
+\begin{equation}
+p(t) = 1 - \frac{t}{T-1},
+\qquad p(t) \in [0,1].
+\end{equation}
+For a raw guidance gradient $g$, scheduled guidance uses
+\begin{equation}
+g_{\mathrm{sched}}(x_t,t) = w(t)\,g(x_t,t),
+\end{equation}
+with one of the following weights:
+\begin{align}
+w_{\mathrm{all}}(t) &= 1, \\
+w_{\mathrm{early}}(t) &= \mathbf{1}[p(t) \le 0.30], \\
+w_{\mathrm{mid}}(t) &= \mathbf{1}[0.30 \le p(t) < 0.70], \\
+w_{\mathrm{late}}(t) &= \mathbf{1}[p(t) \ge 0.70], \\
+w_{\mathrm{window}}(t) &= \mathbf{1}[a \le p(t) \le b], \\
+w_{\mathrm{linear\_ramp}}(t) &= m + (1-m)p(t), \\
+w_{\mathrm{quadratic\_ramp}}(t) &= m + (1-m)p(t)^2, \\
+w_{\mathrm{linear\_decay}}(t) &= m + (1-m)(1-p(t)), \\
+w_{\mathrm{quadratic\_decay}}(t) &= m + (1-m)(1-p(t))^2.
+\end{align}
+Here $a$, $b$, and $m$ are configurable schedule parameters.
+
+\subsection{Composite Guidance}
+If multiple guidance terms are active, the code sums them:
+\begin{equation}
+g_{\mathrm{total}}(x_t,t)
+=
+\sum_{k=1}^K g_k(x_t,t).
+\end{equation}
+
+\section{Polygon Regularity And Geometry Objectives}
+\subsection{Centering And RMS Scale Normalization}
+Given polygon coordinates $v_1,\dots,v_n \in \R^2$, the centered coordinates are
+\begin{equation}
+\tilde{v}_i = v_i - \frac{1}{n}\sum_{j=1}^n v_j.
+\end{equation}
+The RMS radius is
+\begin{equation}
+r_{\mathrm{rms}} = \sqrt{\frac{1}{n}\sum_{i=1}^n \|\tilde{v}_i\|_2^2 + \varepsilon},
+\end{equation}
+and normalized coordinates are
+\begin{equation}
+\bar{v}_i = \frac{\tilde{v}_i}{r_{\mathrm{rms}}}.
+\end{equation}
+
+\subsection{Edge Lengths}
+The edge vectors and lengths are
+\begin{align}
+e_i &= v_{i+1} - v_i, \\
+\ell_i &= \sqrt{\|e_i\|_2^2 + \varepsilon},
+\end{align}
+with cyclic indexing.
+
+\subsection{Signed And Smooth Area}
+The signed polygon area is the shoelace formula:
+\begin{equation}
+A_{\mathrm{signed}}(v)
+=
+\frac{1}{2}
+\sum_{i=1}^n
+\left(
+x_i y_{i+1} - y_i x_{i+1}
+\right).
+\end{equation}
+The differentiable absolute area used for guidance is
+\begin{equation}
+A(v) = \sqrt{A_{\mathrm{signed}}(v)^2 + \varepsilon}.
+\end{equation}
+
+\subsection{Interior Angles}
+Define previous and next edge directions at vertex $i$:
+\begin{align}
+u_i^- &= \frac{v_{i-1} - v_i}{\|v_{i-1} - v_i\|_2 + \varepsilon}, \\
+u_i^+ &= \frac{v_{i+1} - v_i}{\|v_{i+1} - v_i\|_2 + \varepsilon}.
+\end{align}
+Then
+\begin{align}
+d_i &= \langle u_i^-, u_i^+ \rangle, \\
+c_i &= u_{i,x}^- u_{i,y}^+ - u_{i,y}^- u_{i,x}^+, \\
+|c_i|_{\mathrm{smooth}} &= \sqrt{c_i^2 + \varepsilon}, \\
+\theta_i &= \operatorname{atan2}\!\left(|c_i|_{\mathrm{smooth}}, d_i\right).
+\end{align}
+
+\subsection{Coefficient Of Variation}
+For a per-polygon sequence $a_1,\dots,a_n$,
+\begin{align}
+\mu_a &= \frac{1}{n}\sum_{i=1}^n a_i, \\
+\sigma_a &= \sqrt{\frac{1}{n}\sum_{i=1}^n (a_i - \mu_a)^2 + \varepsilon}, \\
+\CV(a) &= \frac{\sigma_a}{\mu_a + \varepsilon}.
+\end{align}
+
+\subsection{Regularity Score}
+The differentiable regularity score implemented in \texttt{regularity\_torch.py} is
+\begin{align}
+\CV_{\mathrm{edge}} &= \CV(\ell_1,\dots,\ell_n), \\
+\CV_{\mathrm{angle}} &= \CV(\theta_1,\dots,\theta_n), \\
+\CV_{\mathrm{radius}} &= \CV(\|\bar{v}_1\|_2,\dots,\|\bar{v}_n\|_2), \\
+s(v)
+&=
+\exp\!\left(
+-\alpha \CV_{\mathrm{edge}}
+-\beta \CV_{\mathrm{angle}}
+-\gamma \CV_{\mathrm{radius}}
+\right).
+\end{align}
+
+\section{Restoration Analogue}
+\subsection{Scene Anchoring}
+Before restoration is evaluated, each polygon is translated into a fixed scene:
+\begin{equation}
+v_i^{\mathrm{scene}}
+=
+v_i - \frac{1}{n}\sum_{j=1}^n v_j + c_{\mathrm{scene}},
+\end{equation}
+where $c_{\mathrm{scene}}$ is the centroid of the configured mutant-protein reference points.
+
+\subsection{Soft Ligand Contact}
+Given scene-anchored vertices $v_i^{\mathrm{scene}}$ and a binding site $b$, dense-mode contact weights are
+\begin{equation}
+w_i
+=
+\frac{\exp\!\left(-\beta_{\mathrm{contact}}\|v_i^{\mathrm{scene}} - b\|_2^2\right)}
+{\sum_j \exp\!\left(-\beta_{\mathrm{contact}}\|v_j^{\mathrm{scene}} - b\|_2^2\right)}.
+\end{equation}
+The graph-mode implementation uses the same formula with a segmented softmax over vertices within each polygon.
+
+The differentiable contact point is
+\begin{equation}
+c(x) = \sum_{i=1}^n w_i\,v_i^{\mathrm{scene}}.
+\end{equation}
+
+\subsection{Protein Restoration}
+The contact drift is
+\begin{equation}
+d_{\mathrm{contact}}(x) = \|c(x) - b\|_2,
+\end{equation}
+and the protein restoration score is a Gaussian radial basis:
+\begin{equation}
+R(x)
+=
+\exp\!\left(
+-\frac{1}{2}
+\frac{d_{\mathrm{contact}}(x)^2}{\sigma_{\mathrm{act}}^2}
+\right).
+\end{equation}
+
+\subsection{DNA-Binding Activation}
+The code maps restoration to DNA-binding competence with a sigmoid:
+\begin{equation}
+B(x)
+=
+\sigmoid\!\left(
+\kappa\left(R(x) - \tau_{\mathrm{DNA}}\right)
+\right),
+\end{equation}
+where $\kappa$ is the binding steepness and $\tau_{\mathrm{DNA}}$ is the activation threshold.
+
+\subsection{Protein And DNA Interpolation}
+If $P_{\mathrm{mut}}$ and $P_{\mathrm{wt}}$ are mutant and wild-type protein reference points, then
+\begin{equation}
+P_{\mathrm{protein}}(x)
+=
+P_{\mathrm{mut}} + R(x)\left(P_{\mathrm{wt}} - P_{\mathrm{mut}}\right).
+\end{equation}
+
+If $d_{\mathrm{unbound}}$ and $d_{\mathrm{bound}}$ are the DNA reference positions, then
+\begin{equation}
+P_{\mathrm{DNA}}(x)
+=
+d_{\mathrm{unbound}} + B(x)\left(d_{\mathrm{bound}} - d_{\mathrm{unbound}}\right).
+\end{equation}
+The restoration terminal distance is
+\begin{equation}
+d_{\mathrm{DNA}}(x)
+=
+\left\|
+P_{\mathrm{DNA}}(x) - d_{\mathrm{bound}}
+\right\|_2.
+\end{equation}
+
+\subsection{Restoration Guidance Objective}
+The timestep weighting used only inside restoration guidance is
+\begin{equation}
+w_{\mathrm{rest}}(t)
+=
+m + (1-m)\,p(t)^\rho,
+\end{equation}
+where $p(t)=1-\frac{t}{T-1}$, $m$ is \texttt{min\_timestep\_weight}, and $\rho$ is \texttt{timestep\_power}.
+
+Without a target DNA distance, the restoration guidance objective is
+\begin{equation}
+\mathcal{J}_{\mathrm{rest}}(x_t,t)
+=
+- \sum_{b=1}^B
+w_{\mathrm{rest}}(t_b)\,
+d_{\mathrm{DNA}}(x_t^{(b)})^2.
+\end{equation}
+With target DNA distance $d^\star$, it becomes
+\begin{equation}
+\mathcal{J}_{\mathrm{rest}}(x_t,t)
+=
+- \sum_{b=1}^B
+w_{\mathrm{rest}}(t_b)\,
+\left(d_{\mathrm{DNA}}(x_t^{(b)}) - d^\star\right)^2.
+\end{equation}
+The guidance field is then
+\begin{equation}
+g_{\mathrm{rest}}(x_t,t) = \lambda \nabla_{x_t}\mathcal{J}_{\mathrm{rest}}(x_t,t).
+\end{equation}
+
+\section{Pocket-Fit Conditioning}
+\subsection{Edge Sampling Along The Ligand Boundary}
+To score whether a ligand fits inside a pocket, the code samples points along each ligand edge. For edge fraction $f \in \mathcal{F}$ and edge $(v_i,v_{i+1})$,
+\begin{equation}
+s_{i,f} = (1-f) v_i + f v_{i+1}.
+\end{equation}
+
+\subsection{Convex Pocket Margins}
+Let the pocket polygon be $p_1,\dots,p_m$. For pocket edge $k$,
+\begin{align}
+e_k &= p_{k+1} - p_k, \\
+r_{q,k} &= q - p_k,
+\end{align}
+for sample point $q$. The signed distance proxy to that half-space is
+\begin{equation}
+\delta_{q,k}
+=
+\frac{e_{k,x} r_{q,k,y} - e_{k,y} r_{q,k,x}}
+{\|e_k\|_2}.
+\end{equation}
+The convex margin used by the code is the minimum over pocket edges:
+\begin{equation}
+\delta_q = \min_k \delta_{q,k}.
+\end{equation}
+
+\subsection{Pocket-Fit Statistics}
+With inside-temperature $\tau_{\mathrm{in}}$,
+\begin{align}
+\mathrm{inside\_fraction}
+&=
+\frac{1}{|\mathcal{Q}|}
+\sum_{q \in \mathcal{Q}}
+\sigmoid\!\left(\frac{\delta_q}{\tau_{\mathrm{in}}}\right), \\
+\mathrm{outside\_penalty}
+&=
+\frac{1}{|\mathcal{Q}|}
+\sum_{q \in \mathcal{Q}} \ReLU(-\delta_q), \\
+\mathrm{clearance\_mean}
+&=
+\frac{1}{|\mathcal{Q}|}
+\sum_{q \in \mathcal{Q}} \max(\delta_q, 0).
+\end{align}
+
+Let $A_{\mathrm{lig}}$ and $A_{\mathrm{pocket}}$ be the smooth absolute areas of the ligand and pocket. The area ratio is
+\begin{equation}
+\mathrm{area\_ratio}
+=
+\frac{A_{\mathrm{lig}}}{A_{\mathrm{pocket}} + \varepsilon}.
+\end{equation}
+The two quadratic penalties are
+\begin{align}
+\mathrm{area\_ratio\_penalty}
+&=
+\left(
+\mathrm{area\_ratio} - r^\star
+\right)^2, \\
+\mathrm{clearance\_penalty}
+&=
+\left(
+\mathrm{clearance\_mean} - c^\star
+\right)^2.
+\end{align}
+
+\subsection{Pocket-Fit Reward}
+The analytic pocket-fit reward is
+\begin{equation}
+\mathrm{fit\_score}
+=
+\mathrm{inside\_fraction}
+- w_{\mathrm{out}}\,\mathrm{outside\_penalty}
+- w_{\mathrm{area}}\,\mathrm{area\_ratio\_penalty}
+- w_{\mathrm{clear}}\,\mathrm{clearance\_penalty}.
+\end{equation}
+
+The corresponding analytic guidance term is
+\begin{equation}
+g_{\mathrm{pocket}}(x_t)
+=
+\lambda \nabla_{x_t}\,\mathrm{fit\_score}(x_t).
+\end{equation}
+
+\subsection{Pocket-Context Surrogate Model}
+The 2D pocket surrogate concatenates ligand and pocket coordinates into a joint graph. Each node uses
+\begin{equation}
+u_i = [\mathrm{coord}_i ; \mathrm{cycle\_enc}_i].
+\end{equation}
+After a linear projection and node-type embedding,
+\begin{equation}
+h_i^{(0)} = W_{\mathrm{in}} u_i + e_{\mathrm{type}(i)}.
+\end{equation}
+If timestep conditioning is enabled,
+\begin{equation}
+h_i^{(0)} \leftarrow h_i^{(0)} + \psi(t_g),
+\end{equation}
+followed by layer normalization.
+
+For edge $(j \to i)$ with edge type $r_{ij}$ and Euclidean distance $d_{ij} = \|x_j - x_i\|_2$, the radial basis expansion is
+\begin{equation}
+\mathrm{RBF}_k(d_{ij})
+=
+\exp\!\left(
+-\gamma (d_{ij} - c_k)^2
+\right).
+\end{equation}
+The message block computes
+\begin{align}
+m_{ij}
+&=
+\mathrm{MLP}_{\mathrm{msg}}
+\left(
+[h_j ; h_i ; e_{r_{ij}} ; \mathrm{RBF}(d_{ij}) ; d_{ij}]
+\right), \\
+\bar{m}_i
+&=
+\frac{1}{|\mathcal{N}(i)|}
+\sum_{j \in \mathcal{N}(i)} m_{ij}, \\
+h_i'
+&=
+\mathrm{LayerNorm}
+\left(
+h_i + \mathrm{MLP}_{\mathrm{upd}}([h_i ; \bar{m}_i])
+\right).
+\end{align}
+After several such layers, the surrogate pools only ligand-node features by mean:
+\begin{equation}
+g_{\mathrm{lig}}
+=
+\frac{1}{|L|}
+\sum_{i \in L} h_i,
+\end{equation}
+and predicts
+\begin{equation}
+\hat{r} = \mathrm{MLP}_{\mathrm{head}}(g_{\mathrm{lig}}).
+\end{equation}
+
+\subsection{Pocket Surrogate Noise Schedule}
+When noisy training is enabled for the pocket surrogate, only ligand coordinates are diffused:
+\begin{equation}
+\tilde{x}_t
+=
+\sqrt{\bar{\alpha}_t}\,x_0
++
+\sqrt{1-\bar{\alpha}_t}\,\epsilon.
+\end{equation}
+The pocket coordinates remain clean.
+
+\section{Ligand-Context Affinity Surrogates}
+\subsection{Radius-Graph Construction}
+For the 3D ligand-context branch, edges are created with Euclidean cutoffs. In its most generic form,
+\begin{equation}
+(i,j) \in E_r
+\iff
+\|p_i - p_j\|_2 \le r.
+\end{equation}
+The code uses separate cutoffs for ligand-ligand and pocket-to-ligand edges.
+
+\subsection{Noisy Ligand Coordinates}
+The \texttt{SurrogateNoiseSchedule} corrupts ligand nodes only:
+\begin{equation}
+\tilde{p}_{i,t}
+=
+\begin{cases}
+\sqrt{\bar{\alpha}_t}\,p_i + \sqrt{1-\bar{\alpha}_t}\,\epsilon_i, & i \in L, \\
+p_i, & i \in P.
+\end{cases}
+\end{equation}
+
+\subsection{Permutation-Invariant Ligand-Context Surrogate}
+Each node begins with an atomic-number embedding plus a node-type embedding:
+\begin{equation}
+h_i^{(0)} = e_{z_i} + e_{\mathrm{type}(i)}.
+\end{equation}
+If timestep conditioning is enabled,
+\begin{equation}
+h_i^{(0)} \leftarrow h_i^{(0)} + \psi(t_g),
+\end{equation}
+followed by layer normalization.
+
+For edge $(j \to i)$, the message block uses the same Gaussian radial basis form as the pocket surrogate:
+\begin{align}
+\mathrm{RBF}_k(d_{ij})
+&=
+\exp\!\left(-\gamma(d_{ij}-c_k)^2\right), \\
+m_{ij}
+&=
+\mathrm{MLP}_{\mathrm{msg}}
+\left(
+[h_j ; h_i ; e_{r_{ij}} ; \mathrm{RBF}(d_{ij}) ; d_{ij}]
+\right), \\
+\bar{m}_i
+&=
+\frac{1}{|\mathcal{N}(i)|}
+\sum_{j \in \mathcal{N}(i)} m_{ij}, \\
+u_i
+&=
+\mathrm{MLP}_{\mathrm{upd}}([h_i ; \bar{m}_i]).
+\end{align}
+The implementation updates only ligand nodes:
+\begin{equation}
+h_i' =
+\begin{cases}
+\mathrm{LayerNorm}(h_i + u_i), & i \in L, \\
+h_i, & i \in P.
+\end{cases}
+\end{equation}
+
+After multiple message-passing layers, the graph representation is pooled over ligand nodes only:
+\begin{equation}
+g =
+\mathrm{Pool}\left(\{h_i : i \in L\}\right),
+\end{equation}
+where $\mathrm{Pool}$ is mean, sum, or max. The final scalar prediction is
+\begin{equation}
+\hat{y} = \mathrm{MLP}_{\mathrm{head}}(g).
+\end{equation}
+
+\subsection{Experimental Affinity Models In \texttt{predict\_binding\_affinity.py}}
+\paragraph{Atomwise MLP.}
+The simplest affinity baseline embeds atom types, concatenates coordinates, applies an atom encoder, mean-pools across atoms in each graph, and predicts a scalar:
+\begin{align}
+h_i &= \mathrm{AtomEncoder}([e_{z_i}; p_i]), \\
+g &= \frac{1}{|V_G|} \sum_{i \in V_G} h_i, \\
+\hat{y} &= \mathrm{MLP}_{\mathrm{readout}}(g).
+\end{align}
+
+\paragraph{Distance-aware message passing.}
+The non-equivariant message-passing affinity model first recenters coordinates:
+\begin{equation}
+\tilde{p}_i = p_i - \frac{1}{|V_G|}\sum_{j \in V_G} p_j.
+\end{equation}
+Its node initialization is
+\begin{equation}
+h_i^{(0)} = W_{\mathrm{in}}[e_{z_i}; \tilde{p}_i] + b_{\mathrm{in}}.
+\end{equation}
+For edge $(j \to i)$ with distance $d_{ij} = \|\tilde{p}_j - \tilde{p}_i\|_2$,
+\begin{align}
+m_{ij} &= \mathrm{MLP}_{\mathrm{msg}}([h_j; h_i; d_{ij}]), \\
+\bar{m}_i &= \frac{1}{|\mathcal{N}(i)|}\sum_{j \in \mathcal{N}(i)} m_{ij}, \\
+h_i' &= \mathrm{MLP}_{\mathrm{upd}}([h_i; \bar{m}_i]).
+\end{align}
+The graph feature is the mean over ligand atoms only,
+\begin{equation}
+g = \frac{1}{|L|}\sum_{i \in L} h_i,
+\end{equation}
+followed by a scalar readout MLP.
+
+\paragraph{SE(3)-equivariant affinity model.}
+The experimental equivariant model uses atomic-number scalars and centered positions:
+\begin{equation}
+x_i^{(0)} = \mathrm{Linear}_{\mathrm{irrep}}([e_{z_i}; \tilde{p}_i]).
+\end{equation}
+For edge $(j \to i)$ with relative vector $r_{ij} = \tilde{p}_j - \tilde{p}_i$, it computes spherical harmonics
+\begin{equation}
+Y^1(r_{ij}),
+\end{equation}
+then an equivariant tensor-product message
+\begin{equation}
+m_{ij} = \mathrm{TP}(h_j, Y^1(r_{ij})).
+\end{equation}
+Messages are averaged at each destination node:
+\begin{align}
+\bar{m}_i &= \frac{1}{\deg(i)}\sum_{j \in \mathcal{N}(i)} m_{ij}, \\
+h_i' &= h_i + \mathrm{LayerNorm}\!\left(\mathrm{Linear}_{\mathrm{msg}}(\bar{m}_i)\right).
+\end{align}
+After projecting node irreps to scalar channels,
+\begin{align}
+s_i &= \mathrm{Linear}_{\mathrm{out}}(h_i), \\
+g &= \frac{1}{|V_G|}\sum_{i \in V_G} s_i, \\
+\hat{y} &= \mathrm{MLP}_{\mathrm{readout}}(g).
+\end{align}
+
+\section{Standard Losses And Reported Metrics}
+\subsection{Mean Squared Error}
+The repository uses MSE in several places:
+\begin{equation}
+\mathrm{MSE}(\hat{y},y)
+=
+\frac{1}{N}\sum_{i=1}^N (\hat{y}_i - y_i)^2.
+\end{equation}
+
+\subsection{Cross-Entropy}
+For classifier guidance-model training:
+\begin{equation}
+\mathrm{CE}(z,y)
+=
+-\log
+\frac{\exp(z_y)}{\sum_c \exp(z_c)}.
+\end{equation}
+
+\subsection{Smooth L1 / Huber Loss}
+Both surrogate-training pipelines use \texttt{SmoothL1Loss(beta = $\delta$)}:
+\begin{equation}
+\ell_\delta(r)
+=
+\begin{cases}
+\dfrac{1}{2\delta} r^2, & |r| < \delta, \\
+|r| - \dfrac{\delta}{2}, & |r| \ge \delta,
+\end{cases}
+\qquad r = \hat{y} - y.
+\end{equation}
+The batch loss is the mean of $\ell_\delta(r_i)$.
+
+\subsection{MAE, RMSE, And Pearson Correlation}
+The main scalar evaluation metrics are
+\begin{align}
+\mathrm{MAE} &= \frac{1}{N}\sum_{i=1}^N |\hat{y}_i - y_i|, \\
+\mathrm{RMSE} &= \sqrt{\frac{1}{N}\sum_{i=1}^N (\hat{y}_i - y_i)^2}, \\
+\rho_{\hat{y},y}
+&=
+\frac{\sum_{i=1}^N (\hat{y}_i - \bar{\hat{y}})(y_i - \bar{y})}
+{\sqrt{\sum_{i=1}^N (\hat{y}_i - \bar{\hat{y}})^2}
+\sqrt{\sum_{i=1}^N (y_i - \bar{y})^2}}.
+\end{align}
+
+\section{Formula-To-File Map}
+\begin{itemize}[leftmargin=1.5em]
+\item Diffusion schedule, $q(x_t \mid x_0)$, $\mu_\theta$, DDPM loss, MLP/GAT/GCN denoisers: \texttt{polydiff/models/diffusion.py}, \texttt{polydiff/models/gat.py}, \texttt{polydiff/models/gcn.py}.
+\item Guidance classifier/regressor architectures and pooling: \texttt{polydiff/models/guidance\_models.py}.
+\item Sampling-time guidance and schedules: \texttt{polydiff/sampling/guidance.py}.
+\item Regularity, area, and polygon geometry formulas: \texttt{polydiff/models/regularity\_torch.py}.
+\item Restoration analogue: \texttt{polydiff/restoration.py}.
+\item Pocket-fit reward and convex-margin geometry: \texttt{polydiff/pocket\_conditioning/geometry.py}.
+\item Pocket-context surrogate and noisy surrogate training: \texttt{polydiff/pocket\_conditioning/surrogate.py}.
+\item Analytic and surrogate pocket guidance: \texttt{polydiff/pocket\_conditioning/study.py}.
+\item Ligand-context 3D surrogate models and noisy edge rebuilding: \texttt{predict\_binding\_affinity/surrogate\_models.py}, \texttt{predict\_binding\_affinity/surrogate\_data.py}, \texttt{predict\_binding\_affinity/train\_surrogate\_model.py}.
+\item Experimental affinity baselines: \texttt{predict\_binding\_affinity/predict\_binding\_affinity.py}.
+\end{itemize}
+
+\end{document}
